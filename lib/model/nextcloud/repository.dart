@@ -55,9 +55,9 @@ abstract class NextcloudRepository {
   // thrown. Failures that concern the whole listing (auth, network, TLS, cancellation, quota, and anything the
   // root collection itself answers) are always thrown.
   // A collection's etag is published through `onCollection` only after its whole subtree was listed or skipped
-  // as unchanged; a sub-collection reported through `onItemFailure` keeps every ancestor unpublished, so the
-  // next crawl descends there again. A reported collection was not enumerated at all: the caller must not
-  // treat its subtree as deleted.
+  // as unchanged, with nothing reported through `onItemFailure` anywhere under it; a reported item or
+  // sub-collection keeps every ancestor unpublished, so the next crawl descends there again. A reported
+  // collection was not enumerated at all: the caller must not treat its subtree as deleted.
   Stream<NextcloudRemoteItem> listMediaTree(
     String relativePath, {
     Map<String, String> knownCollectionEtags = const {},

@@ -27,6 +27,9 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   static const searchPageSize = 500;
   static const _maxSearchPages = 10000;
 
+  // nesting depth below the crawl root at which a collection is reported and not descended into
+  static const maxCrawlDepth = 64;
+
   @override
   final NextcloudAccount account;
 
@@ -197,7 +200,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       return;
     }
     final crawl = _Crawl(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
-    yield* _crawlCollection(rootItem, crawl, _Subtree());
+    yield* _crawlCollection(rootItem, crawl, _Subtree(), 0);
   }
 
   // Lists `collection` and recurses into its changed sub-collections, depth first.
@@ -205,24 +208,40 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   // (or skipped as unchanged): the caller persists that etag as "this subtree was fully enumerated", and
   // on the next sync an unchanged ancestor is not descended into at all. Publishing before a descendant
   // fails would hide that descendant until something under the ancestor changes on the server.
-  Stream<NextcloudRemoteItem> _crawlCollection(NextcloudRemoteItem collection, _Crawl crawl, _Subtree subtree) async* {
+  // The same holds per response: anything reported through `onItemFailure` while this collection is being
+  // listed (an unmappable href, a response without a successful propstat, a result outside the collection)
+  // leaves it incomplete, otherwise that one file would never be retried.
+  Stream<NextcloudRemoteItem> _crawlCollection(NextcloudRemoteItem collection, _Crawl crawl, _Subtree subtree, int depth) async* {
     _checkCancelled(crawl.cancellation);
     final dir = collection.relativePath;
+    final onItemFailure = crawl.onItemFailure;
+    // every failure reported while listing `dir` makes `dir` incomplete
+    final NextcloudItemFailureCallback? onListingFailure = onItemFailure == null
+        ? null
+        : (path, failure) {
+            subtree.complete = false;
+            onItemFailure(path, failure);
+          };
+
+    if (depth > maxCrawlDepth) {
+      // a server can nest collections without end; the crawl must not follow it into the stack limit
+      _reportOrThrow(onListingFailure, dir, const NextcloudParseFailure('collection deeper than $maxCrawlDepth levels'));
+      return;
+    }
+
     final List<NextcloudRemoteItem> children;
     try {
-      children = await _listCollection(dir, crawl.onItemFailure);
+      children = await _listCollection(dir, onListingFailure);
     } on NextcloudFailure catch (e) {
-      final onItemFailure = crawl.onItemFailure;
-      if (dir == crawl.root || onItemFailure == null || !_isItemLevel(e)) rethrow;
+      if (dir == crawl.root || onListingFailure == null || !_isItemLevel(e)) rethrow;
       // one sub-folder the server refuses (403 on a share without permission, 404 on a folder removed
       // meanwhile, a 5xx, a garbled body) must not stop the sync of everything else
-      onItemFailure(dir, e);
-      subtree.complete = false;
+      onListingFailure(dir, e);
       return;
     }
     for (final child in children) {
       if (!_isUnder(child.relativePath, dir)) {
-        _reportOrThrow(crawl.onItemFailure, child.relativePath, NextcloudPathEscapeFailure(child.relativePath));
+        _reportOrThrow(onListingFailure, child.relativePath, NextcloudPathEscapeFailure(child.relativePath));
         continue;
       }
       if (child.isCollection) {
@@ -232,7 +251,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
           continue;
         }
         final sub = _Subtree();
-        yield* _crawlCollection(child, crawl, sub);
+        yield* _crawlCollection(child, crawl, sub, depth + 1);
         if (!sub.complete) subtree.complete = false;
       } else if (child.isMedia) {
         yield child;

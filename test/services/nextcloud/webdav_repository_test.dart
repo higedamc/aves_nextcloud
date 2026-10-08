@@ -20,7 +20,8 @@ final _account = NextcloudAccount(
 const _credentials = NextcloudCredentials(username: 'alice', appPassword: 'app-pass');
 final _expectedAuth = 'Basic ${base64Encode(utf8.encode('alice:app-pass'))}';
 
-String _collection(String href, String etag) => '''
+String _collection(String href, String etag) =>
+    '''
   <d:response>
     <d:href>$href</d:href>
     <d:propstat>
@@ -34,7 +35,8 @@ String _collection(String href, String etag) => '''
     </d:propstat>
   </d:response>''';
 
-String _file(String href, String etag, {String mime = 'image/jpeg', int fileId = 1}) => '''
+String _file(String href, String etag, {String mime = 'image/jpeg', int fileId = 1}) =>
+    '''
   <d:response>
     <d:href>$href</d:href>
     <d:propstat>
@@ -65,7 +67,7 @@ class _Server {
   final List<http.Request> requests = [];
   final Map<String, int> propfindDepthByPath = {};
 
-  _Server({this.supportsSearch = true});
+  new({this.supportsSearch = true});
 
   Future<http.Response> handle(http.Request request) async {
     requests.add(request);
@@ -77,7 +79,16 @@ class _Server {
         return http.Response('', 200, headers: {'Allow': 'OPTIONS, GET, HEAD, PROPFIND, PUT, REPORT${supportsSearch ? ', SEARCH' : ''}', 'DAV': '1, 3'});
       case 'GET':
         if (path == '/ocs/v2.php/cloud/capabilities') {
-          return http.Response(jsonEncode({'ocs': {'data': {'version': {'string': '32.0.11'}}}}), 200);
+          return http.Response(
+            jsonEncode({
+              'ocs': {
+                'data': {
+                  'version': {'string': '32.0.11'},
+                },
+              },
+            }),
+            200,
+          );
         }
         if (path == '/core/preview') {
           return http.Response.bytes([0x89, 0x50, 0x4e, 0x47], 200);

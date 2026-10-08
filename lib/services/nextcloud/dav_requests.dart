@@ -1,7 +1,5 @@
 // Request bodies and namespaces for the Nextcloud WebDAV endpoints used by `WebDavNextcloudRepository`.
 class DavNamespaces {
-  DavNamespaces._();
-
   static const dav = 'DAV:';
   static const oc = 'http://owncloud.org/ns';
   static const nc = 'http://nextcloud.org/ns';
@@ -11,8 +9,6 @@ class DavNamespaces {
 }
 
 class DavRequests {
-  DavRequests._();
-
   static const _namespaceAttributes = 'xmlns:d="${DavNamespaces.dav}" xmlns:oc="${DavNamespaces.oc}" xmlns:nc="${DavNamespaces.nc}"';
 
   // properties requested for every listing; the `nc:metadata-photos-*` ones are only served by Nextcloud 28+
@@ -30,7 +26,8 @@ class DavRequests {
       <nc:metadata-photos-original_date_time/>
       <nc:metadata-photos-gps/>''';
 
-  static const propfindBody = '''<?xml version="1.0" encoding="UTF-8"?>
+  static const propfindBody =
+      '''<?xml version="1.0" encoding="UTF-8"?>
 <d:propfind $_namespaceAttributes>
   <d:prop>$_props
   </d:prop>

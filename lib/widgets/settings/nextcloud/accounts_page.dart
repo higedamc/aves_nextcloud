@@ -3,6 +3,7 @@ import 'package:aves/model/nextcloud/account_store_impl.dart';
 import 'package:aves/model/nextcloud/credential_store_impl.dart';
 import 'package:aves/model/settings/settings.dart';
 import 'package:aves/theme/icons.dart';
+import 'package:aves/widgets/common/action_mixins/feedback.dart';
 import 'package:aves/widgets/common/basic/scaffold.dart';
 import 'package:aves/widgets/common/extensions/build_context.dart';
 import 'package:aves/widgets/common/identity/buttons/outlined_button.dart';
@@ -21,7 +22,7 @@ class NextcloudAccountsPage extends StatelessWidget {
   static const routeName = '/settings/nextcloud_accounts';
 
   static const accountStore = SettingsNextcloudAccountStore();
-  static const credentialStore = SecurityNextcloudCredentialStore();
+  static final credentialStore = SecurityNextcloudCredentialStore();
 
   const new({super.key});
 
@@ -88,7 +89,7 @@ class NextcloudAccountsPage extends StatelessWidget {
   }
 }
 
-class _AccountTile extends StatelessWidget {
+class _AccountTile extends StatelessWidget with FeedbackMixin {
   final NextcloudAccount account;
 
   const new({required this.account});
@@ -152,7 +153,14 @@ class _AccountTile extends StatelessWidget {
       return;
     }
 
-    await NextcloudAccountsPage.credentialStore.writeAppPassword(account, null);
+    final credentialWiped = await NextcloudAccountsPage.credentialStore
+        .writeAppPassword(account, null);
+    if (!credentialWiped) {
+      if (context.mounted) {
+        showFeedback(context, FeedbackType.warn, l10n.genericFailureFeedback);
+      }
+      return;
+    }
     await NextcloudAccountsPage.accountStore.remove(account.id);
   }
 }

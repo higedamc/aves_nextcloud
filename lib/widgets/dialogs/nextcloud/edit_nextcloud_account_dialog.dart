@@ -33,6 +33,13 @@ class _EditNextcloudAccountDialogState
 
   bool get isNew => initialAccount == null;
 
+  bool get _identityChanged {
+    final initial = initialAccount;
+    if (initial == null) return false;
+    return _parsedServerUrl != initial.serverUrl ||
+        _usernameController.text.trim() != initial.username;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -99,16 +106,22 @@ class _EditNextcloudAccountDialogState
         ),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-          child: TextField(
-            controller: _appPasswordController,
-            decoration: InputDecoration(
-              labelText: l10n.nextcloudAccountDialogAppPassword,
-              hintText: isNew
-                  ? null
-                  : l10n.nextcloudAccountDialogAppPasswordKeepHint,
+          child: ListenableBuilder(
+            listenable: Listenable.merge([
+              _serverUrlController,
+              _usernameController,
+            ]),
+            builder: (context, child) => TextField(
+              controller: _appPasswordController,
+              decoration: InputDecoration(
+                labelText: l10n.nextcloudAccountDialogAppPassword,
+                hintText: (isNew || _identityChanged)
+                    ? null
+                    : l10n.nextcloudAccountDialogAppPasswordKeepHint,
+              ),
+              obscureText: true,
+              autofillHints: const [AutofillHints.password],
             ),
-            obscureText: true,
-            autofillHints: const [AutofillHints.password],
           ),
         ),
         Padding(
@@ -159,7 +172,9 @@ class _EditNextcloudAccountDialogState
     final serverUrl = _parsedServerUrl;
     final username = _usernameController.text.trim();
     final rootFolder = _normalizedRootFolder;
-    final hasPassword = isNew ? _appPasswordController.text.isNotEmpty : true;
+    final hasPassword = (isNew || _identityChanged)
+        ? _appPasswordController.text.isNotEmpty
+        : true;
 
     _isValidNotifier.value =
         serverUrl != null &&

@@ -40,12 +40,12 @@ void main() {
     tearDownAll(() async => await tearDownAllServices());
 
     test('starts empty', () async {
-      final store = const SettingsNextcloudAccountStore();
+      const store = SettingsNextcloudAccountStore();
       expect(await store.loadAll(), isEmpty);
     });
 
     test('save adds and updates by id, remove drops it', () async {
-      final store = const SettingsNextcloudAccountStore();
+      const store = SettingsNextcloudAccountStore();
 
       await store.save(account());
       expect((await store.loadAll()).map((v) => v.id), ['acc1']);

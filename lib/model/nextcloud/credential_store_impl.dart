@@ -4,8 +4,8 @@ import 'package:aves/services/common/services.dart';
 
 // Default `NextcloudCredentialStore`, wrapping the same `securityService` channel vault passwords use
 // (Android `EncryptedSharedPreferences`, AES256-GCM, Keystore-backed master key). No new storage mechanism.
-class SecurityNextcloudCredentialStore implements NextcloudCredentialStore {
-  const new();
+class SecurityNextcloudCredentialStore extends NextcloudCredentialStore {
+  new();
 
   @override
   Future<String?> readAppPassword(NextcloudAccount account) =>

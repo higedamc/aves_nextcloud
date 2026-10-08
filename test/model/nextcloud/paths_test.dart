@@ -39,6 +39,19 @@ void main() {
       expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/Photos/2024%20summer/IMG%20001.jpg', root), '2024 summer/IMG 001.jpg');
     });
 
+    test('accepts absolute hrefs (reverse proxy / sabre baseUri)', () {
+      expect(NextcloudPaths.relativePathFromHref('https://host:31001/remote.php/dav/files/alice/Photos/2024/a.jpg', root), '2024/a.jpg');
+      expect(NextcloudPaths.relativePathFromHref('https://host:31001/remote.php/dav/files/alice/Photos/', root), '');
+      expect(NextcloudPaths.relativePathFromHref('https://host:31001/remote.php/dav/files/alice/Photos/2024%20summer/a%26b.jpg', root), '2024 summer/a&b.jpg');
+      expect(NextcloudPaths.relativePathFromHref('https://host:31001/remote.php/dav/files/alice/Documents/a.jpg', root), isNull);
+    });
+
+    test('returns null instead of throwing on undecodable hrefs', () {
+      expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/Photos/%zz.jpg', root), isNull);
+      expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/Photos/a%2', root), isNull);
+      expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/Photos/%C3%28.jpg', root), isNull);
+    });
+
     test('rejects hrefs outside the root', () {
       expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/Documents/x.jpg', root), isNull);
       expect(NextcloudPaths.relativePathFromHref('/remote.php/dav/files/alice/PhotosOld/x.jpg', root), isNull);

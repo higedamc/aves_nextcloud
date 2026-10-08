@@ -33,6 +33,15 @@ class NextcloudAccount {
     this.enabled = true,
   });
 
+  // `id` becomes a directory name (`mirrorDirName`) and a credential key, `username` becomes a URL segment:
+  // both must be single safe path segments. Creators (settings UI) must check these before constructing.
+  static bool isValidId(String id) => id.isNotEmpty && NextcloudPaths.isSafeSegment(id);
+
+  static bool isValidUsername(String username) => username.isNotEmpty && NextcloudPaths.isSafeSegment(username);
+
+  // http(s) only, with a host, and never credentials/query/fragment embedded in the base URL
+  static bool isValidServerUrl(Uri url) => (url.scheme == 'https' || url.scheme == 'http') && url.host.isNotEmpty && url.userInfo.isEmpty && !url.hasQuery && !url.hasFragment;
+
   static const defaultCacheLimitBytes = 2 * 1024 * 1024 * 1024;
 
   String get credentialKey => 'nextcloud_app_password_$id';
@@ -44,8 +53,19 @@ class NextcloudAccount {
 
   bool get isSchemeAllowed => serverUrl.scheme == 'https' || (isInsecure && allowInsecureHttp);
 
-  // e.g. `/remote.php/dav/files/alice` (unencoded)
+  // unencoded form, for comparing against decoded server hrefs (`NextcloudPaths.relativePathFromHref`)
   String get filesRootDavPath => '/remote.php/dav/files/$username';
+
+  // unencoded root href of `rootFolder`, e.g. `/remote.php/dav/files/alice/Photos`
+  String get rootHref => rootFolder.isEmpty ? filesRootDavPath : '$filesRootDavPath/$rootFolder';
+
+  // encoded form, for building request URLs; appends the encoded relative path when given
+  Uri filesUrl([String relativePath = '']) {
+    final encodedRoot = NextcloudPaths.encodeForUrl(rootFolder);
+    final encodedPath = NextcloudPaths.encodeForUrl(relativePath);
+    final segments = ['remote.php', 'dav', 'files', Uri.encodeComponent(username), encodedRoot, encodedPath].where((v) => v.isNotEmpty);
+    return serverUrl.replace(path: '${serverUrl.path.replaceAll(RegExp(r'/+$'), '')}/${segments.join('/')}');
+  }
 
   String get displayName => '$username@${serverUrl.host}';
 
@@ -69,14 +89,26 @@ class NextcloudAccount {
   }
 
   factory NextcloudAccount.fromJson(Map<String, dynamic> json) {
+    final id = json['id'] as String? ?? '';
+    if (!isValidId(id)) {
+      throw const FormatException('unsafe id in account json');
+    }
+    final username = json['username'] as String? ?? '';
+    if (!isValidUsername(username)) {
+      throw const FormatException('unsafe username in account json');
+    }
     final rootFolder = NextcloudPaths.normalize(json['rootFolder'] as String? ?? '');
     if (rootFolder == null) {
       throw FormatException('unsafe rootFolder in account json: ${json['rootFolder']}');
     }
+    final serverUrl = Uri.parse(json['serverUrl'] as String? ?? '');
+    if (!isValidServerUrl(serverUrl)) {
+      throw const FormatException('unsupported serverUrl in account json');
+    }
     return NextcloudAccount(
-      id: json['id'] as String,
-      serverUrl: Uri.parse(json['serverUrl'] as String),
-      username: json['username'] as String,
+      id: id,
+      serverUrl: serverUrl,
+      username: username,
       rootFolder: rootFolder,
       allowInsecureHttp: json['allowInsecureHttp'] as bool? ?? false,
       cacheLimitBytes: json['cacheLimitBytes'] as int? ?? defaultCacheLimitBytes,

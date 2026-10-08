@@ -23,7 +23,7 @@ class NextcloudPaths {
 
   static bool isSafeSegment(String segment) {
     if (segment.isEmpty || segment == '.' || segment == '..') return false;
-    if (segment.contains('\\')) return false;
+    if (segment.contains(separator) || segment.contains('\\')) return false;
     for (final codeUnit in segment.codeUnits) {
       if (codeUnit < 0x20 || codeUnit == 0x7f) return false;
     }
@@ -46,11 +46,23 @@ class NextcloudPaths {
   static String encodeForUrl(String relativePath) => relativePath.split(separator).where((v) => v.isNotEmpty).map(Uri.encodeComponent).join(separator);
 
   /// Converts a server-provided `href` back to a relative path, given the files root
-  /// as it appears in hrefs (e.g. `/remote.php/dav/files/alice/Photos`).
-  /// Returns `null` when the href is outside that root or unsafe.
+  /// as it appears in hrefs (e.g. `/remote.php/dav/files/alice/Photos`, unencoded).
+  /// Accepts both path-only hrefs and absolute ones (`https://host/remote.php/dav/...`),
+  /// as sabre/dav emits either depending on its base URI / reverse proxy setup.
+  /// Returns `null` when the href is outside that root, unsafe, or not decodable:
+  /// this function never throws, so callers can map `null` to `NextcloudPathEscapeFailure`.
   static String? relativePathFromHref(String href, String rootHref) {
-    final decodedRoot = _stripTrailingSeparators(Uri.decodeComponent(rootHref));
-    final decoded = _stripTrailingSeparators(Uri.decodeFull(href));
+    final String decoded;
+    try {
+      final parsed = Uri.parse(href);
+      final rawPath = parsed.hasScheme || parsed.hasAuthority ? parsed.path : href;
+      decoded = _stripTrailingSeparators(Uri.decodeFull(rawPath));
+    } catch (_) {
+      // `Uri.parse` / `Uri.decodeFull` report malformed input with different error types
+      // (`FormatException`, `ArgumentError` for invalid UTF-8); all mean "not a usable href"
+      return null;
+    }
+    final decodedRoot = _stripTrailingSeparators(rootHref);
     if (decoded == decodedRoot) return '';
     if (!decoded.startsWith('$decodedRoot$separator')) return null;
     return normalize(decoded.substring(decodedRoot.length + 1));

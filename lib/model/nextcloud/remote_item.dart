@@ -27,7 +27,7 @@ class NextcloudRemoteItem {
   // from `nc:metadata-photos-*` when the server (Nextcloud 28+) provides them
   final NextcloudPhotoMetadata? photoMetadata;
 
-  const NextcloudRemoteItem({
+  const new({
     required this.relativePath,
     required this.fileId,
     required this.etag,
@@ -62,7 +62,7 @@ class NextcloudPhotoMetadata {
   final DateTime? originalDateTime;
   final double? latitude, longitude;
 
-  const NextcloudPhotoMetadata({
+  const new({
     this.width,
     this.height,
     this.originalDateTime,
@@ -90,7 +90,7 @@ class NextcloudServerInfo {
   // whether the server provides `nc:metadata-photos-*` props
   final bool supportsPhotoMetadata;
 
-  const NextcloudServerInfo({
+  const new({
     required this.version,
     required this.supportsSearch,
     required this.supportsInfiniteDepth,

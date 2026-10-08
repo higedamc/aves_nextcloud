@@ -22,7 +22,7 @@ class NextcloudSyncRequest {
 
   final NextcloudCancellation? cancellation;
 
-  const NextcloudSyncRequest({required this.account, this.force = false, this.cancellation});
+  const new({required this.account, this.force = false, this.cancellation});
 }
 
 enum NextcloudSyncPhase { probing, listing, downloading, evicting, done, failed }
@@ -32,7 +32,7 @@ class NextcloudSyncProgress {
   final int done, total;
   final int bytesDone;
 
-  const NextcloudSyncProgress({required this.phase, this.done = 0, this.total = 0, this.bytesDone = 0});
+  const new({required this.phase, this.done = 0, this.total = 0, this.bytesDone = 0});
 
   @override
   String toString() => '$runtimeType{phase=$phase, done=$done, total=$total, bytes=$bytesDone}';
@@ -47,7 +47,7 @@ class NextcloudSyncResult {
   // fatal failure that stopped the sync, if any
   final NextcloudFailure? fatal;
 
-  const NextcloudSyncResult({
+  const new({
     this.added = 0,
     this.updated = 0,
     this.removed = 0,

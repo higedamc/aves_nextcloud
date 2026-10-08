@@ -21,6 +21,8 @@ abstract class StorageService {
 
   Future<String> getVaultRoot();
 
+  Future<String> getNextcloudMirrorRoot();
+
   Future<int?> getFreeSpace(StorageVolume volume);
 
   // returns number of deleted directories
@@ -123,6 +125,17 @@ class PlatformStorageService implements StorageService {
   Future<String> getVaultRoot() async {
     try {
       final result = await _platform.invokeMethod('getVaultRoot');
+      return result as String;
+    } on PlatformException catch (e, stack) {
+      await reportService.recordError(e, stack);
+    }
+    return '';
+  }
+
+  @override
+  Future<String> getNextcloudMirrorRoot() async {
+    try {
+      final result = await _platform.invokeMethod('getNextcloudMirrorRoot');
       return result as String;
     } on PlatformException catch (e, stack) {
       await reportService.recordError(e, stack);

@@ -35,4 +35,7 @@ class FakeStorageService extends Fake implements StorageService {
 
   @override
   Future<String> getVaultRoot() => SynchronousFuture('/vault/');
+
+  @override
+  Future<String> getNextcloudMirrorRoot() => SynchronousFuture('/nextcloud/');
 }

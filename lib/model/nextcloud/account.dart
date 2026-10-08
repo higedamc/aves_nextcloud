@@ -23,7 +23,7 @@ class NextcloudAccount {
 
   final bool enabled;
 
-  const NextcloudAccount({
+  const new({
     required this.id,
     required this.serverUrl,
     required this.username,
@@ -88,7 +88,7 @@ class NextcloudAccount {
     );
   }
 
-  factory NextcloudAccount.fromJson(Map<String, dynamic> json) {
+  factory fromJson(Map<String, dynamic> json) {
     final id = json['id'] as String? ?? '';
     if (!isValidId(id)) {
       throw const FormatException('unsafe id in account json');
@@ -140,7 +140,7 @@ class NextcloudAccount {
 class NextcloudCredentials {
   final String username, appPassword;
 
-  const NextcloudCredentials({required this.username, required this.appPassword});
+  const new({required this.username, required this.appPassword});
 
   // intentionally no secret in `toString`
   @override

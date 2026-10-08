@@ -5,8 +5,6 @@
 // Normalization rejects anything that could escape the root on either side:
 // `.`/`..` segments, empty segments, backslashes, and control characters.
 class NextcloudPaths {
-  NextcloudPaths._();
-
   static const separator = '/';
 
   /// Returns the normalized relative path, or `null` when the input is unsafe.

@@ -13,7 +13,7 @@ class NextcloudMirrorIndexEntry {
   // bumped on view; drives LRU eviction
   final DateTime lastAccessAt;
 
-  const NextcloudMirrorIndexEntry({
+  const new({
     required this.relativePath,
     required this.etag,
     required this.fileId,

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:aves/model/nextcloud/account.dart';
+import 'package:aves/model/nextcloud/errors.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 
 // Cooperative cancellation handle shared by long operations (listing, downloads, sync).
@@ -13,6 +14,11 @@ class NextcloudCancellation {
 }
 
 typedef NextcloudProgressCallback = void Function(int receivedBytes, int? totalBytes);
+
+// Reports one item (or one sub-collection) that could not be listed, so a listing keeps going past it.
+// `path` is the relative path when it is known (a sub-collection that could not be listed), otherwise the
+// raw server href (an href that could not be mapped inside the account root).
+typedef NextcloudItemFailureCallback = void Function(String path, NextcloudFailure failure);
 
 // Remote access contract (layer L1: WebDAV client). One instance is bound to one account + credentials.
 // Implementations:
@@ -40,9 +46,23 @@ abstract class NextcloudRepository {
   //      (what the official Photos web app uses; unaffected by the PROPFIND finite-depth restriction),
   //   2. PROPFIND `Depth: 1` crawl, skipping subtrees whose collection etag matches `knownCollectionEtags`.
   // Emission order is unspecified. Cancellation stops emission with `NextcloudCancelledFailure`.
+  // `onCollection` is called for every collection the crawl visits or skips (with its current etag), so the
+  // caller can persist etags for the next `knownCollectionEtags`. The SEARCH strategy returns a full snapshot
+  // and never calls it; a caller that gets no collection callbacks must diff against the full snapshot.
+  // `onItemFailure` receives item-level failures (an href that cannot be mapped inside the root, a sub-collection
+  // that answers 403/404/5xx or with a body that is not a multistatus) and the listing continues without that
+  // item; the sync records them as `NextcloudSyncResult.itemFailures`. Without it, the first such failure is
+  // thrown. Failures that concern the whole listing (auth, network, TLS, cancellation, quota, and anything the
+  // root collection itself answers) are always thrown.
+  // A collection's etag is published through `onCollection` only after its whole subtree was listed or skipped
+  // as unchanged, with nothing reported through `onItemFailure` anywhere under it; a reported item or
+  // sub-collection keeps every ancestor unpublished, so the next crawl descends there again. A reported
+  // collection was not enumerated at all: the caller must not treat its subtree as deleted.
   Stream<NextcloudRemoteItem> listMediaTree(
     String relativePath, {
     Map<String, String> knownCollectionEtags = const {},
+    void Function(NextcloudRemoteItem collection)? onCollection,
+    NextcloudItemFailureCallback? onItemFailure,
     NextcloudCancellation? cancellation,
   });
 

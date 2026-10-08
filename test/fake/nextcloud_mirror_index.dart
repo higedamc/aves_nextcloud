@@ -31,7 +31,11 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
     getLeastRecentlyAccessedCalls++;
     final entries = _rows(account).values.toList();
-    entries.sort((a, b) => a.lastAccessAt.compareTo(b.lastAccessAt));
+    // same total order as the sqflite index: `lastAccessAt`, then `relativePath` to break ties
+    entries.sort((a, b) {
+      final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
+      return byAccess != 0 ? byAccess : a.relativePath.compareTo(b.relativePath);
+    });
     return entries.take(limit).toList();
   }
 

@@ -12,8 +12,6 @@ import 'package:xml/xml.dart';
 // returned `relativePath` is relative to the account root folder. Any href that cannot be mapped
 // inside that root is a `NextcloudPathEscapeFailure`: a server that lies about hrefs gets nothing.
 class MultistatusParser {
-  MultistatusParser._();
-
   static List<NextcloudRemoteItem> parse(String body, {required String rootHref}) {
     final XmlDocument document;
     try {

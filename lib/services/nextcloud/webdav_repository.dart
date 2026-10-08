@@ -34,7 +34,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   final http.Client _client;
   NextcloudServerInfo? _serverInfo;
 
-  WebDavNextcloudRepository(this.account, this._credentials, {http.Client? client}) : _client = client ?? http.Client();
+  new(this.account, this._credentials, {http.Client? client}) : _client = client ?? http.Client();
 
   // last probe result, if any
   NextcloudServerInfo? get serverInfo => _serverInfo;
@@ -388,7 +388,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
 class WebDavNextcloudRepositoryFactory implements NextcloudRepositoryFactory {
   final http.Client Function()? _clientBuilder;
 
-  const WebDavNextcloudRepositoryFactory({http.Client Function()? clientBuilder}) : _clientBuilder = clientBuilder;
+  const new({this._clientBuilder});
 
   @override
   NextcloudRepository open(NextcloudAccount account, NextcloudCredentials credentials) {

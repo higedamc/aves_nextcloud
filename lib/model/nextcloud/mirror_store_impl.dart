@@ -28,7 +28,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     final root = _mirrorRootOverride ?? await storageService.getNextcloudMirrorRoot();
     if (root.isEmpty) {
       // the platform call failed and already reported; every path operation would silently become relative
-      throw const NextcloudParseFailure('could not resolve the Nextcloud mirror root');
+      throw const NextcloudLocalStorageFailure('could not resolve the Nextcloud mirror root');
     }
     _mirrorRoot = _stripTrailingSeparator(root);
     await _index.init();

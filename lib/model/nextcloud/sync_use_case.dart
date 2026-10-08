@@ -275,7 +275,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       } on NextcloudFailure catch (e) {
         stats.itemFailures[path] = e;
       } on FileSystemException catch (e) {
-        stats.itemFailures[path] = NextcloudNetworkFailure('local delete failed: ${e.message}', cause: e);
+        stats.itemFailures[path] = NextcloudLocalStorageFailure('local delete failed: ${e.message}', cause: e);
       }
     }
     if (gone.isEmpty) return;
@@ -283,7 +283,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     if (countAsRemoved) {
       stats.removed += gone.length;
     } else {
-      stats.evicted += gone.length;
+      stats.lost += gone.length;
     }
   }
 
@@ -354,7 +354,7 @@ class _Listing {
 }
 
 class _Stats {
-  int added = 0, updated = 0, removed = 0, skipped = 0, evicted = 0;
+  int added = 0, updated = 0, removed = 0, skipped = 0, evicted = 0, lost = 0;
   final itemFailures = <String, NextcloudFailure>{};
 
   NextcloudSyncResult result({NextcloudFailure? fatal}) => NextcloudSyncResult(
@@ -363,6 +363,7 @@ class _Stats {
     removed: removed,
     skipped: skipped,
     evicted: evicted,
+    lost: lost,
     itemFailures: Map.unmodifiable(itemFailures),
     fatal: fatal,
   );

@@ -67,7 +67,19 @@ class _Server {
   final List<http.Request> requests = [];
   final Map<String, int> propfindDepthByPath = {};
 
+  // collection paths (with trailing slash) that answer PROPFIND with 403
+  final Set<String> forbidden = {};
+
+  // an extra file response injected into the root listing and the SEARCH result
+  String? injectedHref;
+
   new({this.supportsSearch = true});
+
+  String _withInjected(String body) {
+    final href = injectedHref;
+    if (href == null) return body;
+    return body.replaceFirst('</d:multistatus>', '${_file(href, 'x-v1', fileId: 9)}</d:multistatus>');
+  }
 
   Future<http.Response> handle(http.Request request) async {
     requests.add(request);
@@ -101,6 +113,7 @@ class _Server {
         final depth = int.parse(request.headers['depth']!);
         final key = path.endsWith('/') ? path : '$path/';
         propfindDepthByPath[key] = depth;
+        if (forbidden.contains(key)) return http.Response('', 403);
         final body = _tree[key];
         if (body == null) return http.Response('', 404);
         if (depth == 0) {
@@ -108,16 +121,18 @@ class _Server {
           final selfOnly = _multistatus([_collection(key, key == '$_davFiles/' ? 'root-v1' : 'sub-v1')]);
           return http.Response(selfOnly, 207);
         }
-        return http.Response(body, 207);
+        return http.Response(key == '$_davFiles/' ? _withInjected(body) : body, 207);
       case 'SEARCH':
         expect(path, '/remote.php/dav/');
         expect(request.body, contains('<d:href>/files/alice/Photos</d:href>'));
         expect(request.body, contains('<d:depth>infinity</d:depth>'));
-        return http.Response(_multistatus([_file('$_davFiles/a.jpg', 'a-v1', fileId: 1), _file('$_davFiles/Sub/b.mp4', 'b-v1', mime: 'video/mp4', fileId: 3)]), 207);
+        return http.Response(_withInjected(_multistatus([_file('$_davFiles/a.jpg', 'a-v1', fileId: 1), _file('$_davFiles/Sub/b.mp4', 'b-v1', mime: 'video/mp4', fileId: 3)])), 207);
     }
     return http.Response('', 405);
   }
 }
+
+int _offsetOf(String searchBody) => int.parse(RegExp(r'<ns:firstresult>(\d+)</ns:firstresult>').firstMatch(searchBody)!.group(1)!);
 
 WebDavNextcloudRepository _repo(_Server server) => WebDavNextcloudRepository(_account, _credentials, client: MockClient(server.handle));
 
@@ -161,6 +176,67 @@ void main() {
     final none = await _repo(unchanged).listMediaTree('', knownCollectionEtags: {'': 'root-v1'}).toList();
     expect(none, isEmpty);
     expect(unchanged.requests.where((r) => r.method == 'PROPFIND').length, 1);
+  });
+
+  test('an href outside the root is reported through onItemFailure and the listing continues', () async {
+    const escaped = '/remote.php/dav/files/alice/Documents/secret.jpg';
+    for (final supportsSearch in [true, false]) {
+      final server = _Server(supportsSearch: supportsSearch)..injectedHref = escaped;
+      final failures = <String, NextcloudFailure>{};
+      final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+      expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4'], reason: 'search=$supportsSearch');
+      expect(failures.keys, [escaped]);
+      expect(failures[escaped], isA<NextcloudPathEscapeFailure>());
+    }
+  });
+
+  test('without onItemFailure, an href outside the root still fails the listing', () async {
+    final server = _Server(supportsSearch: false)..injectedHref = '/remote.php/dav/files/alice/Documents/secret.jpg';
+    await expectLater(_repo(server).listMediaTree('').toList(), throwsA(isA<NextcloudPathEscapeFailure>()));
+    await expectLater(_repo(server).listCollection(''), throwsA(isA<NextcloudPathEscapeFailure>()));
+  });
+
+  test('crawl reports a sub-folder it cannot list and continues with the rest', () async {
+    final server = _Server(supportsSearch: false)..forbidden.add('$_davFiles/Sub/');
+    final failures = <String, NextcloudFailure>{};
+    final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+    expect(items.map((v) => v.relativePath), ['a.jpg']);
+    expect(failures.keys, ['Sub']);
+    expect((failures['Sub'] as NextcloudServerFailure).statusCode, 403);
+
+    // the same 403 on the root is the whole listing failing, reported or not
+    final rootForbidden = _Server(supportsSearch: false)..forbidden.add('$_davFiles/');
+    await expectLater(_repo(rootForbidden).listMediaTree('', onItemFailure: (_, _) {}).toList(), throwsA(isA<NextcloudServerFailure>()));
+  });
+
+  test('SEARCH paging counts responses, not items, so a page with a hole is not mistaken for the last one', () async {
+    const pageSize = WebDavNextcloudRepository.searchPageSize;
+    final offsets = <int>[];
+    final client = MockClient((request) async {
+      switch (request.method) {
+        case 'OPTIONS':
+          return http.Response('', 200, headers: {'Allow': 'OPTIONS, PROPFIND, SEARCH'});
+        case 'GET':
+          return http.Response('{}', 200);
+        case 'SEARCH':
+          final offset = _offsetOf(request.body);
+          offsets.add(offset);
+          if (offset == 0) {
+            // a full page, with one response that maps outside the root
+            final responses = [for (var i = 0; i < pageSize - 1; i++) _file('$_davFiles/p$i.jpg', 'v', fileId: i), _file('/remote.php/dav/files/alice/Documents/x.jpg', 'v', fileId: 9999)];
+            return http.Response(_multistatus(responses), 207);
+          }
+          return http.Response(_multistatus([_file('$_davFiles/last.jpg', 'v', fileId: 10000)]), 207);
+      }
+      return http.Response('', 405);
+    });
+    final repo = WebDavNextcloudRepository(_account, _credentials, client: client);
+    final failures = <String, NextcloudFailure>{};
+    final items = await repo.listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+    expect(offsets, [0, pageSize]);
+    expect(items.length, pageSize);
+    expect(items.last.relativePath, 'last.jpg');
+    expect(failures.keys, ['/remote.php/dav/files/alice/Documents/x.jpg']);
   });
 
   test('listCollection and stat', () async {
@@ -219,7 +295,8 @@ void main() {
     }
 
     await expectLater((await withStatus(401)).probe(), throwsA(isA<NextcloudAuthFailure>()));
-    await expectLater((await withStatus(403)).probe(), throwsA(isA<NextcloudAuthFailure>()));
+    // 403 is per resource on Nextcloud (share without permission, access control, lock); a bad app password is 401
+    await expectLater((await withStatus(403)).probe(), throwsA(isA<NextcloudServerFailure>().having((e) => e.statusCode, 'statusCode', 403)));
     await expectLater((await withStatus(403, body: '<s:exception>propfind-finite-depth</s:exception>')).listCollection(''), throwsA(isA<NextcloudDepthRefusedFailure>()));
     await expectLater((await withStatus(404)).listCollection('Sub'), throwsA(isA<NextcloudNotFoundFailure>()));
     await expectLater((await withStatus(302)).probe(), throwsA(isA<NextcloudServerFailure>()));

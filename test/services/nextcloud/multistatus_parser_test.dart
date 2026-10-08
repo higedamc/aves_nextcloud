@@ -117,6 +117,20 @@ void main() {
     expect(() => MultistatusParser.parse(body, rootHref: _root), throwsA(isA<NextcloudPathEscapeFailure>()));
   });
 
+  test('reports an href outside the root through onItemFailure and keeps the rest', () {
+    final body = _propfindDepth1.replaceAll('/Photos/notes.txt', '/Documents/notes.txt');
+    final failures = <String, NextcloudFailure>{};
+    final page = MultistatusParser.parsePage(body, rootHref: _root, onItemFailure: (path, failure) => failures[path] = failure);
+    expect(page.items.map((v) => v.relativePath), ['', '2024 summer', 'IMG 001.jpg']);
+    expect(page.responseCount, 4);
+    expect(failures.keys, ['/remote.php/dav/files/alice/Documents/notes.txt']);
+    expect(failures.values.single, isA<NextcloudPathEscapeFailure>());
+  });
+
+  test('a document that is not a multistatus is rejected even with onItemFailure', () {
+    expect(() => MultistatusParser.parsePage('<d:error xmlns:d="DAV:"/>', rootHref: _root, onItemFailure: (_, _) {}), throwsA(isA<NextcloudParseFailure>()));
+  });
+
   test('rejects traversal hidden in percent encoding', () {
     final body = _propfindDepth1.replaceAll('/Photos/notes.txt', '/Photos/..%2F..%2Fetc%2Fpasswd');
     expect(() => MultistatusParser.parse(body, rootHref: _root), throwsA(isA<NextcloudPathEscapeFailure>()));
@@ -136,5 +150,7 @@ void main() {
   </d:response>
 </d:multistatus>''';
     expect(MultistatusParser.parse(body, rootHref: _root), isEmpty);
+    // the response still counts towards the page size
+    expect(MultistatusParser.parsePage(body, rootHref: _root).responseCount, 1);
   });
 }

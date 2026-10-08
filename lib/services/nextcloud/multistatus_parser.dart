@@ -3,16 +3,26 @@ import 'dart:io';
 import 'package:aves/model/nextcloud/errors.dart';
 import 'package:aves/model/nextcloud/paths.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
+import 'package:aves/model/nextcloud/repository.dart';
 import 'package:aves/services/nextcloud/dav_requests.dart';
 import 'package:collection/collection.dart';
 import 'package:xml/xml.dart';
 
 // Parses a WebDAV `207 Multi-Status` body (PROPFIND or SEARCH) into remote items.
 // `rootHref` is the unencoded root href of the account (`NextcloudAccount.rootHref`), so every
-// returned `relativePath` is relative to the account root folder. Any href that cannot be mapped
-// inside that root is a `NextcloudPathEscapeFailure`: a server that lies about hrefs gets nothing.
+// returned `relativePath` is relative to the account root folder. An href that cannot be mapped
+// inside that root is a `NextcloudPathEscapeFailure`: with `onItemFailure` the response is reported
+// and skipped, without it the failure is thrown. A document that is not a multistatus at all is
+// always a thrown `NextcloudParseFailure`: nothing in it can be trusted.
+typedef MultistatusPage = ({List<NextcloudRemoteItem> items, int responseCount});
+
 class MultistatusParser {
-  static List<NextcloudRemoteItem> parse(String body, {required String rootHref}) {
+  static List<NextcloudRemoteItem> parse(String body, {required String rootHref}) => parsePage(body, rootHref: rootHref).items;
+
+  // `responseCount` counts every `d:response` in the document, including the ones that yielded no item
+  // (skipped, or without a successful propstat), so a caller paging through SEARCH results can tell a short
+  // last page from a full page with holes.
+  static MultistatusPage parsePage(String body, {required String rootHref, NextcloudItemFailureCallback? onItemFailure}) {
     final XmlDocument document;
     try {
       document = XmlDocument.parse(body);
@@ -26,14 +36,19 @@ class MultistatusParser {
     }
 
     final items = <NextcloudRemoteItem>[];
+    var responseCount = 0;
     for (final response in multistatus.findElements('response', namespace: DavNamespaces.dav)) {
+      responseCount++;
       final href = response.getElement('href', namespace: DavNamespaces.dav)?.innerText.trim();
       if (href == null || href.isEmpty) {
         throw const NextcloudParseFailure('response without href');
       }
       final relativePath = NextcloudPaths.relativePathFromHref(href, rootHref);
       if (relativePath == null) {
-        throw NextcloudPathEscapeFailure(href);
+        final failure = NextcloudPathEscapeFailure(href);
+        if (onItemFailure == null) throw failure;
+        onItemFailure(href, failure);
+        continue;
       }
 
       final prop = _okProp(response);
@@ -43,7 +58,7 @@ class MultistatusParser {
       }
       items.add(_toItem(prop, relativePath));
     }
-    return items;
+    return (items: items, responseCount: responseCount);
   }
 
   static XmlElement? _okProp(XmlElement response) {

@@ -6,7 +6,8 @@ import 'package:aves/model/nextcloud/repository.dart';
 //
 // Algorithm fixed by this contract:
 //   1. `probe()`; on `NextcloudAuthFailure` stop and surface it (never retry with the same password).
-//   2. `listMediaTree(account.rootFolder, knownCollectionEtags: <from last run>)` → remote snapshot.
+//   2. `listMediaTree('', knownCollectionEtags: <from last run>)` → remote snapshot (`''` is the account root
+//      folder: the repository prefixes `account.rootFolder` itself).
 //   3. Diff against `mirrorStore.listAll(account)` by relativePath + etag:
 //        added/updated → download (newest `lastModified` first), `record`, then create the `AvesEntry`
 //        via `mediaFetchService.getEntry(Uri.file(localPath))` with `origin = EntryOrigins.nextcloud`,

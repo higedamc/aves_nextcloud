@@ -28,7 +28,11 @@ class NextcloudPaths {
     return true;
   }
 
-  static String join(String parent, String child) => parent.isEmpty ? child : '$parent$separator$child';
+  static String join(String parent, String child) => parent.isEmpty
+      ? child
+      : child.isEmpty
+      ? parent
+      : '$parent$separator$child';
 
   static String parentOf(String relativePath) {
     final index = relativePath.lastIndexOf(separator);

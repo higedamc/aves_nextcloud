@@ -66,6 +66,8 @@ void main() {
   test('join, parentOf, nameOf', () {
     expect(NextcloudPaths.join('', 'a'), 'a');
     expect(NextcloudPaths.join('a', 'b'), 'a/b');
+    expect(NextcloudPaths.join('a', ''), 'a');
+    expect(NextcloudPaths.join('', ''), '');
     expect(NextcloudPaths.parentOf('a/b/c'), 'a/b');
     expect(NextcloudPaths.parentOf('a'), '');
     expect(NextcloudPaths.nameOf('a/b/c.jpg'), 'c.jpg');

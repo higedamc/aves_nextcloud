@@ -23,14 +23,21 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   // Rebuilt whenever the source reloads (`clearEntries` happens under `SourceState.loading`), and kept in step
   // with adds and removals through the event bus: the sink is the only writer of these entries, but the source
   // may drop one on its own (a refresh of an entry whose file is gone).
+  //
+  // The index is only read once the source is out of `loading`: a full reload (`MediaStoreSource._loadEntries`,
+  // reached from startup, a widened scope and the album/tag pickers) clears the collection first and adds the
+  // `origin = nextcloud` rows last, so an index built in between would answer "no entry" for a URI that has a DB
+  // row, and the put would insert a second row for it. The source leaves `loading` only after those rows are in.
   Map<String, AvesEntry>? _byUri;
+  Completer<void>? _loaded;
   final Set<StreamSubscription> _subscriptions = {};
 
-  // cataloguing is batched: a sync puts files one at a time, and `analyze` is sized for sets of entries
-  final Set<AvesEntry> _pendingAnalysis = {};
-  Timer? _analysisTimer;
-  static const analysisBatchSize = 100;
-  static const analysisDelay = Duration(seconds: 2);
+  // Cataloguing and collection notification are batched: a sync puts files one at a time, `analyze` is sized for
+  // sets of entries, and a notified `addEntries` makes every open grid re-sort the whole collection.
+  final Set<AvesEntry> _pending = {};
+  Timer? _flushTimer;
+  static const batchSize = 100;
+  static const flushDelay = Duration(seconds: 2);
 
   new(this._source, this._mirror) {
     _source.stateNotifier.addListener(_onSourceStateChanged);
@@ -43,8 +50,8 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     _subscriptions
       ..forEach((sub) => sub.cancel())
       ..clear();
-    _analysisTimer?.cancel();
-    _pendingAnalysis.clear();
+    _flushTimer?.cancel();
+    _pending.clear();
   }
 
   Map<String, AvesEntry> get _index => _byUri ??= {
@@ -52,8 +59,19 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
       if (entry.isNextcloud) entry.uri: entry,
   };
 
+  // completes once the source is not loading, i.e. once every stored entry is in the collection
+  Future<void> _whenLoaded() {
+    if (_source.state != SourceState.loading) return Future.value();
+    return (_loaded ??= Completer<void>()).future;
+  }
+
   void _onSourceStateChanged() {
-    if (_source.state == SourceState.loading) _byUri = null;
+    if (_source.state == SourceState.loading) {
+      _byUri = null;
+    } else {
+      _loaded?.complete();
+      _loaded = null;
+    }
   }
 
   void _onEntriesAdded(EntryAddedEvent event) {
@@ -68,7 +86,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
       final uris = event.entries.map((entry) => entry.uri).toSet();
       index.removeWhere((uri, _) => uris.contains(uri));
     }
-    _pendingAnalysis.removeAll(event.entries);
+    _pending.removeAll(event.entries);
   }
 
   String _uriFor(NextcloudAccount account, String relativePath) => Uri.file(_mirror.localPathFor(account, relativePath)).toString();
@@ -79,10 +97,13 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     final fetched = await mediaFetchService.getEntry(uri, null, allowUnsized: true);
     if (fetched == null) return false;
 
+    // from here to `addEntries` nothing yields, so the index and the collection cannot change under the lookup
+    await _whenLoaded();
     final existing = _index[uri];
     if (existing != null && !identical(_source.getEntryById(existing.id), existing)) {
-      // the source dropped it behind our back; treat the file as new
+      // the source dropped it behind our back; treat the file as new, without leaving a row for the old entry
       _index.remove(uri);
+      await localMediaDb.removeIds({existing.id});
     } else if (existing != null) {
       // same path, new bytes: refresh in place, so the entry keeps its id, favourite and cover
       await _source.refreshEntries({existing}, {EntryDataType.basic, EntryDataType.aspectRatio, EntryDataType.catalog, EntryDataType.address});
@@ -90,10 +111,13 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     }
 
     final entry = fetched.copyWith(id: localMediaDb.nextId, origin: EntryOrigins.nextcloud);
-    _source.addEntries({entry});
+    // added silently, and announced in batches by `flush`
+    _source.addEntries({entry}, notify: false);
+    // the row is written per file: a batched write would leave a mirrored file with an index row and no entry
+    // after a crash, which no later sync can see (its etag matches)
     await localMediaDb.insertEntries({entry});
     _index[uri] = entry;
-    _scheduleAnalysis(entry);
+    _schedule(entry);
     return true;
   }
 
@@ -101,12 +125,13 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths) async {
     if (relativePaths.isEmpty) return;
     final uris = relativePaths.map((path) => _uriFor(account, path)).toSet();
-    _pendingAnalysis.removeWhere((entry) => uris.contains(entry.uri));
+    _pending.removeWhere((entry) => uris.contains(entry.uri));
     await _source.removeEntries(uris, includeTrash: true);
   }
 
   // every entry under the account's mirror, with or without an index row (used by a purge)
   Future<void> removeAccountEntries(NextcloudAccount account) async {
+    await _whenLoaded();
     final uris = _index.values
         .where((entry) {
           final path = entry.path;
@@ -115,26 +140,32 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
         .map((entry) => entry.uri)
         .toSet();
     if (uris.isEmpty) return;
-    _pendingAnalysis.removeWhere((entry) => uris.contains(entry.uri));
+    _pending.removeWhere((entry) => uris.contains(entry.uri));
     await _source.removeEntries(uris, includeTrash: true);
   }
 
-  void _scheduleAnalysis(AvesEntry entry) {
-    _pendingAnalysis.add(entry);
-    if (_pendingAnalysis.length >= analysisBatchSize) {
-      flushAnalysis();
+  void _schedule(AvesEntry entry) {
+    _pending.add(entry);
+    if (_pending.length >= batchSize) {
+      flush();
       return;
     }
-    _analysisTimer?.cancel();
-    _analysisTimer = Timer(analysisDelay, flushAnalysis);
+    _flushTimer?.cancel();
+    _flushTimer = Timer(flushDelay, flush);
   }
 
-  void flushAnalysis() {
-    _analysisTimer?.cancel();
-    _analysisTimer = null;
-    if (_pendingAnalysis.isEmpty) return;
-    final batch = Set.of(_pendingAnalysis);
-    _pendingAnalysis.clear();
+  // Announces the entries added since the last flush to the collection once, then catalogues them.
+  // Called by the batch size, the delay, and the end of a sync.
+  void flush() {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    if (_pending.isEmpty) return;
+    final batch = Set.of(_pending);
+    _pending.clear();
+    _source
+      ..updateDerivedFilters(batch)
+      ..notifyAlbumsChanged()
+      ..eventBus.fire(EntryAddedEvent(batch));
     unawaited(_source.analyze(null, entries: batch));
   }
 }

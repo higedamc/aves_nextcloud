@@ -56,10 +56,11 @@ String _multistatus(List<String> responses) => '<?xml version="1.0"?><d:multista
 
 const _davFiles = '/remote.php/dav/files/alice/Photos';
 
-// a two-level tree: Photos/{a.jpg, notes.txt, Sub/{b.mp4}}
+// a three-level tree: Photos/{a.jpg, notes.txt, Sub/{b.mp4, Deep/{c.jpg}}}
 final _tree = <String, String>{
   '$_davFiles/': _multistatus([_collection('$_davFiles/', 'root-v1'), _file('$_davFiles/a.jpg', 'a-v1', fileId: 1), _file('$_davFiles/notes.txt', 'n-v1', mime: 'text/plain', fileId: 2), _collection('$_davFiles/Sub/', 'sub-v1')]),
-  '$_davFiles/Sub/': _multistatus([_collection('$_davFiles/Sub/', 'sub-v1'), _file('$_davFiles/Sub/b.mp4', 'b-v1', mime: 'video/mp4', fileId: 3)]),
+  '$_davFiles/Sub/': _multistatus([_collection('$_davFiles/Sub/', 'sub-v1'), _file('$_davFiles/Sub/b.mp4', 'b-v1', mime: 'video/mp4', fileId: 3), _collection('$_davFiles/Sub/Deep/', 'deep-v1')]),
+  '$_davFiles/Sub/Deep/': _multistatus([_collection('$_davFiles/Sub/Deep/', 'deep-v1'), _file('$_davFiles/Sub/Deep/c.jpg', 'c-v1', fileId: 4)]),
 };
 
 class _Server {
@@ -159,22 +160,29 @@ void main() {
     final server = _Server(supportsSearch: false);
     final collections = <NextcloudRemoteItem>[];
     final items = await _repo(server).listMediaTree('', onCollection: collections.add).toList();
-    expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4']);
-    expect(collections.map((v) => '${v.relativePath}=${v.etag}'), ['=root-v1', 'Sub=sub-v1']);
+    expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']);
+    // etags come out post-order: a collection is published only once its whole subtree was listed
+    expect(collections.map((v) => '${v.relativePath}=${v.etag}'), ['Sub/Deep=deep-v1', 'Sub=sub-v1', '=root-v1']);
     expect(server.propfindDepthByPath['$_davFiles/'], 1);
     expect(server.propfindDepthByPath['$_davFiles/Sub/'], 1);
+    expect(server.propfindDepthByPath['$_davFiles/Sub/Deep/'], 1);
     expect(server.requests.where((r) => r.method == 'SEARCH'), isEmpty);
   });
 
   test('crawl skips sub-trees whose collection etag is unchanged, and the whole tree when the root is unchanged', () async {
     final server = _Server(supportsSearch: false);
-    final items = await _repo(server).listMediaTree('', knownCollectionEtags: {'Sub': 'sub-v1'}).toList();
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', knownCollectionEtags: {'Sub': 'sub-v1'}, onCollection: collections.add).toList();
     expect(items.map((v) => v.relativePath), ['a.jpg']);
     expect(server.propfindDepthByPath.containsKey('$_davFiles/Sub/'), isFalse);
+    // an unchanged sub-tree is skipped, and its etag is still good
+    expect(collections.map((v) => v.relativePath), ['Sub', '']);
 
     final unchanged = _Server(supportsSearch: false);
-    final none = await _repo(unchanged).listMediaTree('', knownCollectionEtags: {'': 'root-v1'}).toList();
+    final rootOnly = <NextcloudRemoteItem>[];
+    final none = await _repo(unchanged).listMediaTree('', knownCollectionEtags: {'': 'root-v1'}, onCollection: rootOnly.add).toList();
     expect(none, isEmpty);
+    expect(rootOnly.map((v) => v.relativePath), ['']);
     expect(unchanged.requests.where((r) => r.method == 'PROPFIND').length, 1);
   });
 
@@ -184,7 +192,8 @@ void main() {
       final server = _Server(supportsSearch: supportsSearch)..injectedHref = escaped;
       final failures = <String, NextcloudFailure>{};
       final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
-      expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4'], reason: 'search=$supportsSearch');
+      // the SEARCH fixture is a static two-item snapshot; the crawl walks the full three-level tree
+      expect(items.map((v) => v.relativePath), supportsSearch ? ['a.jpg', 'Sub/b.mp4'] : ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg'], reason: 'search=$supportsSearch');
       expect(failures.keys, [escaped]);
       expect(failures[escaped], isA<NextcloudPathEscapeFailure>());
     }
@@ -199,14 +208,72 @@ void main() {
   test('crawl reports a sub-folder it cannot list and continues with the rest', () async {
     final server = _Server(supportsSearch: false)..forbidden.add('$_davFiles/Sub/');
     final failures = <String, NextcloudFailure>{};
-    final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
     expect(items.map((v) => v.relativePath), ['a.jpg']);
     expect(failures.keys, ['Sub']);
     expect((failures['Sub'] as NextcloudServerFailure).statusCode, 403);
+    // neither the failed folder nor its ancestor gets an etag: persisting one would hide `Sub` until it changes
+    expect(collections, isEmpty);
 
     // the same 403 on the root is the whole listing failing, reported or not
     final rootForbidden = _Server(supportsSearch: false)..forbidden.add('$_davFiles/');
     await expectLater(_repo(rootForbidden).listMediaTree('', onItemFailure: (_, _) {}).toList(), throwsA(isA<NextcloudServerFailure>()));
+  });
+
+  test('a failed sub-folder keeps every ancestor unpublished, siblings still get their etag', () async {
+    final server = _Server(supportsSearch: false)..forbidden.add('$_davFiles/Sub/Deep/');
+    final failures = <String, NextcloudFailure>{};
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
+    expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4']);
+    expect(failures.keys, ['Sub/Deep']);
+    // `Sub` listed fine but a descendant did not: with `Sub` persisted, the next crawl would skip it and never
+    // reach `Deep` again until something under `Sub` changes on the server
+    expect(collections, isEmpty);
+
+    // the next crawl, with nothing persisted, lists everything again and the transient failure heals
+    final healed = _Server(supportsSearch: false);
+    final again = <NextcloudRemoteItem>[];
+    await _repo(healed).listMediaTree('', onCollection: again.add).toList();
+    expect(again.map((v) => v.relativePath), ['Sub/Deep', 'Sub', '']);
+  });
+
+  test('SEARCH paging keeps going past a full page of holes but stops when the server ignores the offset', () async {
+    const pageSize = WebDavNextcloudRepository.searchPageSize;
+    http.Client clientWith(String Function(int offset) pageFor, List<int> offsets) => MockClient((request) async {
+      switch (request.method) {
+        case 'OPTIONS':
+          return http.Response('', 200, headers: {'Allow': 'OPTIONS, PROPFIND, SEARCH'});
+        case 'GET':
+          return http.Response('{}', 200);
+        case 'SEARCH':
+          final offset = _offsetOf(request.body);
+          offsets.add(offset);
+          return http.Response(pageFor(offset), 207);
+      }
+      return http.Response('', 405);
+    });
+    // page 0: full, every response outside the root (all holes); page 1: short, one item
+    const outside = '/remote.php/dav/files/alice/Documents/x.jpg';
+    final holesThenItem = <int>[];
+    final items = await WebDavNextcloudRepository(
+      _account,
+      _credentials,
+      client: clientWith((offset) => offset == 0 ? _multistatus([for (var i = 0; i < pageSize; i++) _file(outside, 'v', fileId: i)]) : _multistatus([_file('$_davFiles/last.jpg', 'v', fileId: 1)]), holesThenItem),
+    ).listMediaTree('', onItemFailure: (_, _) {}).toList();
+    expect(holesThenItem, [0, pageSize]);
+    expect(items.map((v) => v.relativePath), ['last.jpg']);
+
+    // a server that ignores the offset returns the same full page forever: stop after the first repeat
+    final ignoresOffset = <int>[];
+    final repeated = await WebDavNextcloudRepository(
+      _account,
+      _credentials,
+      client: clientWith((_) => _multistatus([for (var i = 0; i < pageSize; i++) _file('$_davFiles/p$i.jpg', 'v', fileId: i)]), ignoresOffset),
+    ).listMediaTree('').toList();
+    expect(ignoresOffset, [0, pageSize]);
+    expect(repeated.length, pageSize);
   });
 
   test('SEARCH paging counts responses, not items, so a page with a hole is not mistaken for the last one', () async {

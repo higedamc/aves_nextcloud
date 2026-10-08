@@ -171,8 +171,9 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       }
       // a short page is the last one; the response count is used rather than the item count because a page
       // can have holes (skipped hrefs, responses without a successful propstat) and still be full.
-      // `added == 0` on a full page means the server ignored the offset: stop rather than loop forever.
-      if (parsed.responseCount < searchPageSize || added == 0) break;
+      // `added == 0` with items on a full page means the server ignored the offset: stop rather than loop
+      // forever. A full page whose responses all had holes has no items; keep paging, `_maxSearchPages` bounds it.
+      if (parsed.responseCount < searchPageSize || (added == 0 && parsed.items.isNotEmpty)) break;
     }
     return results;
   }
@@ -190,40 +191,55 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     if (!rootItem.isCollection) {
       throw NextcloudNotFoundFailure(root);
     }
-    onCollection?.call(rootItem);
     if (knownCollectionEtags[root] == rootItem.etag) {
       // Nextcloud propagates etag changes up to every ancestor, so an unchanged root means an unchanged tree
+      onCollection?.call(rootItem);
       return;
     }
+    final crawl = _Crawl(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
+    yield* _crawlCollection(rootItem, crawl, _Subtree());
+  }
 
-    final pending = <String>[root];
-    while (pending.isNotEmpty) {
-      _checkCancelled(cancellation);
-      final dir = pending.removeAt(0);
-      final List<NextcloudRemoteItem> children;
-      try {
-        children = await _listCollection(dir, onItemFailure);
-      } on NextcloudFailure catch (e) {
-        if (dir == root || onItemFailure == null || !_isItemLevel(e)) rethrow;
-        // one sub-folder the server refuses (403 on a share without permission, 404 on a folder removed
-        // meanwhile, a 5xx, a garbled body) must not stop the sync of everything else
-        onItemFailure(dir, e);
+  // Lists `collection` and recurses into its changed sub-collections, depth first.
+  // A collection's etag is published through `onCollection` only once its whole subtree has been listed
+  // (or skipped as unchanged): the caller persists that etag as "this subtree was fully enumerated", and
+  // on the next sync an unchanged ancestor is not descended into at all. Publishing before a descendant
+  // fails would hide that descendant until something under the ancestor changes on the server.
+  Stream<NextcloudRemoteItem> _crawlCollection(NextcloudRemoteItem collection, _Crawl crawl, _Subtree subtree) async* {
+    _checkCancelled(crawl.cancellation);
+    final dir = collection.relativePath;
+    final List<NextcloudRemoteItem> children;
+    try {
+      children = await _listCollection(dir, crawl.onItemFailure);
+    } on NextcloudFailure catch (e) {
+      final onItemFailure = crawl.onItemFailure;
+      if (dir == crawl.root || onItemFailure == null || !_isItemLevel(e)) rethrow;
+      // one sub-folder the server refuses (403 on a share without permission, 404 on a folder removed
+      // meanwhile, a 5xx, a garbled body) must not stop the sync of everything else
+      onItemFailure(dir, e);
+      subtree.complete = false;
+      return;
+    }
+    for (final child in children) {
+      if (!_isUnder(child.relativePath, dir)) {
+        _reportOrThrow(crawl.onItemFailure, child.relativePath, NextcloudPathEscapeFailure(child.relativePath));
         continue;
       }
-      for (final child in children) {
-        if (!_isUnder(child.relativePath, dir)) {
-          _reportOrThrow(onItemFailure, child.relativePath, NextcloudPathEscapeFailure(child.relativePath));
+      if (child.isCollection) {
+        if (crawl.knownCollectionEtags[child.relativePath] == child.etag) {
+          // unchanged since it was last fully enumerated: skip it, and the etag is still good
+          crawl.onCollection?.call(child);
           continue;
         }
-        if (child.isCollection) {
-          onCollection?.call(child);
-          if (knownCollectionEtags[child.relativePath] != child.etag) {
-            pending.add(child.relativePath);
-          }
-        } else if (child.isMedia) {
-          yield child;
-        }
+        final sub = _Subtree();
+        yield* _crawlCollection(child, crawl, sub);
+        if (!sub.complete) subtree.complete = false;
+      } else if (child.isMedia) {
+        yield child;
       }
+    }
+    if (subtree.complete) {
+      crawl.onCollection?.call(collection);
     }
   }
 
@@ -415,6 +431,22 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     }
     return value;
   }
+}
+
+// parameters shared by every level of one crawl
+class _Crawl {
+  final String root;
+  final Map<String, String> knownCollectionEtags;
+  final void Function(NextcloudRemoteItem collection)? onCollection;
+  final NextcloudItemFailureCallback? onItemFailure;
+  final NextcloudCancellation? cancellation;
+
+  const new(this.root, this.knownCollectionEtags, this.onCollection, this.onItemFailure, this.cancellation);
+}
+
+// whether every collection under one crawl level was listed (or skipped as unchanged)
+class _Subtree {
+  bool complete = true;
 }
 
 class WebDavNextcloudRepositoryFactory implements NextcloudRepositoryFactory {

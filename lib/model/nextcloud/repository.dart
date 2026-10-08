@@ -50,10 +50,14 @@ abstract class NextcloudRepository {
   // caller can persist etags for the next `knownCollectionEtags`. The SEARCH strategy returns a full snapshot
   // and never calls it; a caller that gets no collection callbacks must diff against the full snapshot.
   // `onItemFailure` receives item-level failures (an href that cannot be mapped inside the root, a sub-collection
-  // that answers 403/404/5xx or with an unparseable body) and the listing continues without that item; the sync
-  // records them as `NextcloudSyncResult.itemFailures`. Without it, the first such failure is thrown. Failures
-  // that concern the whole listing (auth, network, TLS, cancellation, a body that is not a multistatus at all,
-  // the root collection itself) are always thrown.
+  // that answers 403/404/5xx or with a body that is not a multistatus) and the listing continues without that
+  // item; the sync records them as `NextcloudSyncResult.itemFailures`. Without it, the first such failure is
+  // thrown. Failures that concern the whole listing (auth, network, TLS, cancellation, quota, and anything the
+  // root collection itself answers) are always thrown.
+  // A collection's etag is published through `onCollection` only after its whole subtree was listed or skipped
+  // as unchanged; a sub-collection reported through `onItemFailure` keeps every ancestor unpublished, so the
+  // next crawl descends there again. A reported collection was not enumerated at all: the caller must not
+  // treat its subtree as deleted.
   Stream<NextcloudRemoteItem> listMediaTree(
     String relativePath, {
     Map<String, String> knownCollectionEtags = const {},

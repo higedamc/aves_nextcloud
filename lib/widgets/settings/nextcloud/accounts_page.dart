@@ -18,7 +18,7 @@ import 'package:provider/provider.dart';
 // Account/settings UI (layer L2). Account removal here only drops the account entry and its credential;
 // the mirror directory on disk (layer L3, `NextcloudMirrorStore.purge`) is not wired up yet, because L3
 // is still just a contract. Whoever lands the integration leaf should route removal through that store too.
-class NextcloudAccountsPage extends StatelessWidget {
+class NextcloudAccountsPage extends StatelessWidget with FeedbackMixin {
   static const routeName = '/settings/nextcloud_accounts';
 
   static const accountStore = SettingsNextcloudAccountStore();
@@ -71,7 +71,8 @@ class NextcloudAccountsPage extends StatelessWidget {
     );
   }
 
-  static Future<void> _add(BuildContext context) async {
+  Future<void> _add(BuildContext context) async {
+    final l10n = context.l10n;
     final result = await showAvesDialog<(NextcloudAccount, String?)>(
       context: context,
       builder: (context) => const EditNextcloudAccountDialog(),
@@ -83,7 +84,16 @@ class NextcloudAccountsPage extends StatelessWidget {
 
     final (account, newPassword) = result;
     if (newPassword != null) {
-      await credentialStore.writeAppPassword(account, newPassword);
+      final written = await credentialStore.writeAppPassword(
+        account,
+        newPassword,
+      );
+      if (!written) {
+        if (context.mounted) {
+          showFeedback(context, FeedbackType.warn, l10n.genericFailureFeedback);
+        }
+        return;
+      }
     }
     await accountStore.save(account);
   }
@@ -124,6 +134,7 @@ class _AccountTile extends StatelessWidget with FeedbackMixin {
   }
 
   Future<void> _edit(BuildContext context) async {
+    final l10n = context.l10n;
     final result = await showAvesDialog<(NextcloudAccount, String?)>(
       context: context,
       builder: (context) => EditNextcloudAccountDialog(initialAccount: account),
@@ -135,10 +146,14 @@ class _AccountTile extends StatelessWidget with FeedbackMixin {
 
     final (updated, newPassword) = result;
     if (newPassword != null) {
-      await NextcloudAccountsPage.credentialStore.writeAppPassword(
-        updated,
-        newPassword,
-      );
+      final written = await NextcloudAccountsPage.credentialStore
+          .writeAppPassword(updated, newPassword);
+      if (!written) {
+        if (context.mounted) {
+          showFeedback(context, FeedbackType.warn, l10n.genericFailureFeedback);
+        }
+        return;
+      }
     }
     await NextcloudAccountsPage.accountStore.save(updated);
   }

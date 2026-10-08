@@ -25,7 +25,7 @@ void main() {
   test(
     'round trips the app password under the account credential key',
     () async {
-      final store = const SecurityNextcloudCredentialStore();
+      final store = SecurityNextcloudCredentialStore();
 
       expect(await store.readAppPassword(account), isNull);
 
@@ -43,7 +43,7 @@ void main() {
   test(
     'credentialsFor pairs the stored password with the account username',
     () async {
-      final store = const SecurityNextcloudCredentialStore();
+      final store = SecurityNextcloudCredentialStore();
       await store.writeAppPassword(account, 's3cret');
 
       final credentials = await store.credentialsFor(account);

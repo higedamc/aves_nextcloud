@@ -5,6 +5,9 @@ import 'package:flutter_test/flutter_test.dart';
 import '../../common.dart';
 
 void main() {
+  setUpAll(() async => await setUpAllServices());
+  tearDownAll(() async => await tearDownAllServices());
+
   NextcloudAccount account({String id = 'acc1', String username = 'alice'}) =>
       NextcloudAccount.fromJson({
         'id': id,
@@ -35,9 +38,7 @@ void main() {
   });
 
   group('SettingsNextcloudAccountStore', () {
-    setUpAll(() async => await setUpAllServices());
     setUp(() async => await setUpServices());
-    tearDownAll(() async => await tearDownAllServices());
 
     test('starts empty', () async {
       const store = SettingsNextcloudAccountStore();

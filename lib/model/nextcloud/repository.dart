@@ -40,9 +40,13 @@ abstract class NextcloudRepository {
   //      (what the official Photos web app uses; unaffected by the PROPFIND finite-depth restriction),
   //   2. PROPFIND `Depth: 1` crawl, skipping subtrees whose collection etag matches `knownCollectionEtags`.
   // Emission order is unspecified. Cancellation stops emission with `NextcloudCancelledFailure`.
+  // `onCollection` is called for every collection the crawl visits or skips (with its current etag), so the
+  // caller can persist etags for the next `knownCollectionEtags`. The SEARCH strategy returns a full snapshot
+  // and never calls it; a caller that gets no collection callbacks must diff against the full snapshot.
   Stream<NextcloudRemoteItem> listMediaTree(
     String relativePath, {
     Map<String, String> knownCollectionEtags = const {},
+    void Function(NextcloudRemoteItem collection)? onCollection,
     NextcloudCancellation? cancellation,
   });
 

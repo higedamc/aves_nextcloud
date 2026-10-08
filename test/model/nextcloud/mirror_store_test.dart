@@ -82,7 +82,7 @@ void main() {
 
     test('fails instead of falling back to a relative root', () async {
       final broken = NextcloudMirrorStoreImpl(index, mirrorRoot: '');
-      await expectLater(broken.init(), throwsA(isA<NextcloudParseFailure>()));
+      await expectLater(broken.init(), throwsA(isA<NextcloudLocalStorageFailure>()));
     });
 
     test('rejects use before init', () {

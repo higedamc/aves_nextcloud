@@ -256,7 +256,8 @@ void main() {
       final result = await sync(useCase);
       expect(mirror.rows(accountWith()).containsKey('Sub/b.mp4'), isFalse);
       expect(sink.removed, {'Sub/b.mp4'});
-      expect(result.evicted, 1);
+      expect(result.lost, 1);
+      expect(result.evicted, 0);
       expect(result.removed, 0);
     });
 

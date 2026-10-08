@@ -42,6 +42,9 @@ class NextcloudSyncProgress {
 class NextcloudSyncResult {
   final int added, updated, removed, skipped, evicted;
 
+  // rows whose mirror file was missing and that the listing could not refill: dropped with their entries
+  final int lost;
+
   // failures of individual items; the sync keeps going past them
   final Map<String, NextcloudFailure> itemFailures;
 
@@ -54,6 +57,7 @@ class NextcloudSyncResult {
     this.removed = 0,
     this.skipped = 0,
     this.evicted = 0,
+    this.lost = 0,
     this.itemFailures = const {},
     this.fatal,
   });
@@ -61,7 +65,7 @@ class NextcloudSyncResult {
   bool get isSuccess => fatal == null;
 
   @override
-  String toString() => '$runtimeType{added=$added, updated=$updated, removed=$removed, skipped=$skipped, evicted=$evicted, itemFailures=${itemFailures.length}, fatal=$fatal}';
+  String toString() => '$runtimeType{added=$added, updated=$updated, removed=$removed, skipped=$skipped, evicted=$evicted, lost=$lost, itemFailures=${itemFailures.length}, fatal=$fatal}';
 }
 
 abstract class NextcloudSyncUseCase {

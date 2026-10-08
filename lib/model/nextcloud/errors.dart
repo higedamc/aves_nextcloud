@@ -75,3 +75,11 @@ class NextcloudServerFailure extends NextcloudFailure {
 class NextcloudCancelledFailure extends NextcloudFailure {
   const new() : super('cancelled');
 }
+
+// the local mirror could not be read or written (mirror root unavailable, a file that would not delete):
+// a device-side problem, never a server verdict
+class NextcloudLocalStorageFailure extends NextcloudFailure {
+  final Object? cause;
+
+  const new(super.message, {this.cause});
+}

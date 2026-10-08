@@ -421,6 +421,8 @@ class EntryActionDelegate with FeedbackMixin, PermissionAwareMixin, SizeAwareMix
   }
 
   Future<void> _delete(BuildContext context, AvesEntry targetEntry) async {
+    if (excludeRemoteReadOnly(context, {targetEntry}) == null) return;
+
     final vault = vaults.getVault(targetEntry.directory);
     final enableBin = vault?.useBin ?? settings.enableBin;
 

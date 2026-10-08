@@ -1025,6 +1025,59 @@
   "nextcloudAccountDialogAppPasswordKeepHint": "Leave blank to keep the current password",
   "nextcloudAccountDialogRootFolder": "Folder to browse",
   "nextcloudAccountDialogAllowInsecureHttp": "Allow unencrypted (http://) connection",
+  "nextcloudSyncTooltip": "Sync now",
+  "nextcloudSyncStatusSyncing": "Syncing…",
+  "nextcloudSyncStatusDownloading": "Downloading {done}/{total}",
+  "@nextcloudSyncStatusDownloading": {
+    "placeholders": {
+      "done": {
+        "type": "int",
+        "format": "decimalPattern"
+      },
+      "total": {
+        "type": "int",
+        "format": "decimalPattern"
+      }
+    }
+  },
+  "nextcloudSyncStatusDone": "Last sync: {added} added, {updated} updated, {removed} removed, {failed} failed",
+  "@nextcloudSyncStatusDone": {
+    "placeholders": {
+      "added": {
+        "type": "int",
+        "format": "decimalPattern"
+      },
+      "updated": {
+        "type": "int",
+        "format": "decimalPattern"
+      },
+      "removed": {
+        "type": "int",
+        "format": "decimalPattern"
+      },
+      "failed": {
+        "type": "int",
+        "format": "decimalPattern"
+      }
+    }
+  },
+  "nextcloudSyncStatusFailed": "Sync failed: {reason}",
+  "@nextcloudSyncStatusFailed": {
+    "placeholders": {
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
+  "nextcloudReadOnlyFeedback": "{count, plural, =1{1 Nextcloud item is read-only and was skipped} other{{count} Nextcloud items are read-only and were skipped}}",
+  "@nextcloudReadOnlyFeedback": {
+    "placeholders": {
+      "count": {
+        "type": "int",
+        "format": "decimalPattern"
+      }
+    }
+  },
 
   "settingsPermissionsTile": "Permissions",
   "settingsPermissionsPageTitle": "Permissions",

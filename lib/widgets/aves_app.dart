@@ -9,6 +9,7 @@ import 'package:aves/model/app/intent.dart';
 import 'package:aves/model/app_inventory.dart';
 import 'package:aves/model/device.dart';
 import 'package:aves/model/filters/recent.dart';
+import 'package:aves/model/nextcloud/nextcloud.dart';
 import 'package:aves/model/settings/defaults.dart';
 import 'package:aves/model/settings/enums/display_refresh_rate_mode.dart';
 import 'package:aves/model/settings/enums/screen_on.dart';
@@ -455,6 +456,8 @@ class _AvesAppState extends State<AvesApp> with WidgetsBindingObserver {
     unawaited(deviceService.setLocaleConfig(AvesApp.supportedLocales));
     unawaited(storageService.deleteTempDirectory());
     unawaited(_setupErrorReporting());
+    // after `settings.init`: the account list lives in settings
+    nextcloud.syncOnceWhenReady(_mediaStoreSource);
 
     debugPrint('App setup in ${stopwatch.elapsed.inMilliseconds}ms');
   }

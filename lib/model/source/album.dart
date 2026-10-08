@@ -2,6 +2,7 @@ import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/filters/container/album_group.dart';
 import 'package:aves/model/filters/container/dynamic_album.dart';
 import 'package:aves/model/filters/covered/stored_album.dart';
+import 'package:aves/model/nextcloud/nextcloud.dart';
 import 'package:aves/model/settings/settings.dart';
 import 'package:aves/model/source/collection_source.dart';
 import 'package:aves/model/vaults/vaults.dart';
@@ -219,6 +220,7 @@ mixin AlbumMixin on SourceBase {
     }
 
     if (type == AlbumType.vault) return pContext.basename(dirPath);
+    if (type == AlbumType.nextcloud) return nextcloud.albumDisplayName(dirPath);
 
     final dir = androidFileUtils.relativeDirectoryFromPath(dirPath);
     if (dir == null) return dirPath;

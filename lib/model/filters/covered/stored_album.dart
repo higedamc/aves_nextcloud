@@ -85,6 +85,8 @@ class StoredAlbumFilter extends CollectionFilter with CoveredFilter, AlbumBaseFi
       case .regular:
       case .vault:
         break;
+      case .nextcloud:
+        return SynchronousFuture(colors.nextcloud);
       case .app:
         final appColor = colors.appColor(album);
         if (appColor != null) return appColor;

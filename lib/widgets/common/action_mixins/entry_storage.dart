@@ -6,6 +6,7 @@ import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/entry/extensions/favourites.dart';
 import 'package:aves/model/entry/extensions/keys.dart';
 import 'package:aves/model/entry/extensions/multipage.dart';
+import 'package:aves/model/entry/extensions/nextcloud.dart';
 import 'package:aves/model/entry/extensions/props.dart';
 import 'package:aves/model/favourites.dart';
 import 'package:aves/model/filters/covered/stored_album.dart';
@@ -378,6 +379,17 @@ mixin EntryStorageMixin on FeedbackMixin, PermissionAwareMixin, SizeAwareMixin, 
     return true;
   }
 
+  // Nextcloud mirrors are read-only in v1: nothing is deleted, binned, moved or renamed from Aves.
+  // Returns the entries that can be written, or null when none can; the user is told about the rest either way.
+  Set<AvesEntry>? excludeRemoteReadOnly(BuildContext context, Set<AvesEntry> entries) {
+    final readOnly = entries.where((entry) => entry.isRemoteReadOnly).toSet();
+    if (readOnly.isEmpty) return entries;
+
+    showFeedback(context, FeedbackType.warn, context.l10n.nextcloudReadOnlyFeedback(readOnly.length));
+    final writable = entries.difference(readOnly);
+    return writable.isEmpty ? null : writable;
+  }
+
   // returns whether it completed the action (with or without failures)
   Future<bool> doMove(
     BuildContext context, {
@@ -386,6 +398,13 @@ mixin EntryStorageMixin on FeedbackMixin, PermissionAwareMixin, SizeAwareMixin, 
     bool hideShowAction = false,
     VoidCallback? onSuccess,
   }) async {
+    if (moveType != MoveType.copy && moveType != MoveType.export) {
+      // a copy only reads the mirror
+      final writable = excludeRemoteReadOnly(context, entries);
+      if (writable == null) return false;
+      entries = writable;
+    }
+
     if (moveType == MoveType.toBin) {
       final l10n = context.l10n;
       if (!await showSkippableConfirmationDialog(
@@ -441,6 +460,10 @@ mixin EntryStorageMixin on FeedbackMixin, PermissionAwareMixin, SizeAwareMixin, 
     required bool persist,
     VoidCallback? onSuccess,
   }) async {
+    final writable = excludeRemoteReadOnly(context, entriesToNewName.keys.toSet());
+    if (writable == null) return false;
+    entriesToNewName = Map.fromEntries(entriesToNewName.entries.where((kv) => writable.contains(kv.key)));
+
     final entries = entriesToNewName.keys.toSet();
     final todoCount = entries.length;
     assert(todoCount > 0);

@@ -137,6 +137,7 @@ class MediaStoreSource extends CollectionSource {
     notifyAlbumsChanged();
 
     await _loadVaultEntries(scopeDirectory);
+    await _loadNextcloudEntries(scopeDirectory);
 
     debugPrint('$runtimeType load ${stopwatch.elapsed} load metadata');
     if (scopeDirectory != null) {
@@ -434,6 +435,14 @@ class MediaStoreSource extends CollectionSource {
 
   Future<void> _loadVaultEntries(String? directory) async {
     addEntries(await localMediaDb.loadEntries(origin: EntryOrigins.vault, directory: directory));
+  }
+
+  // nextcloud
+
+  // Mirrored files are rows like vault items (`origin = nextcloud`); the sync (main app only) keeps them in step
+  // with the server and the mirror, so loading is all the source does with them.
+  Future<void> _loadNextcloudEntries(String? directory) async {
+    addEntries(await localMediaDb.loadEntries(origin: EntryOrigins.nextcloud, directory: directory));
   }
 
   Future<void> _refreshVaultEntries({

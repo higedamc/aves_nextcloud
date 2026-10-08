@@ -31,7 +31,7 @@ class AndroidFileUtils {
   static const recoveryDir = 'Lost & Found';
   static const trashDirPath = '#trash';
 
-  late final String separator, vaultRoot, primaryStorage;
+  late final String separator, vaultRoot, nextcloudMirrorRoot, primaryStorage;
   late final String dcimPath, downloadPath, moviesPath, picturesPath, avesVideoCapturesPath;
   late final Set<String> videoCapturesPaths;
   Set<StorageVolume> storageVolumes = {};
@@ -51,6 +51,7 @@ class AndroidFileUtils {
     separator = pContext.separator;
     await _initStorageVolumes();
     vaultRoot = await storageService.getVaultRoot();
+    nextcloudMirrorRoot = _stripTrailingSeparators(await storageService.getNextcloudMirrorRoot());
     _initPaths();
 
     appInventory.areAppNamesReadyNotifier.addListener(_invalidateAlbumTypeCache);
@@ -154,9 +155,21 @@ class AndroidFileUtils {
     albumTypesChangeNotifier.notify();
   }
 
+  // empty when the platform could not provide the mirror root (already reported)
+  bool isNextcloudMirrorPath(String path) => nextcloudMirrorRoot.isNotEmpty && path.startsWith('$nextcloudMirrorRoot$separator');
+
+  String _stripTrailingSeparators(String path) {
+    var result = path;
+    while (result.length > 1 && result.endsWith(separator)) {
+      result = result.substring(0, result.length - 1);
+    }
+    return result;
+  }
+
   AlbumType getAlbumType(String dirPath) {
     final result = _albumTypeCache.putIfAbsent(dirPath, () {
       if (vaults.isVault(dirPath)) return AlbumType.vault;
+      if (isNextcloudMirrorPath(dirPath)) return AlbumType.nextcloud;
 
       if (isCameraPath(dirPath)) return AlbumType.camera;
       if (isDownloadPath(dirPath)) return AlbumType.download;

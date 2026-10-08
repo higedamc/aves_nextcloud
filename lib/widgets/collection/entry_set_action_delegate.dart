@@ -336,6 +336,10 @@ class EntrySetActionDelegate with FeedbackMixin, PermissionAwareMixin, SizeAware
     required Set<AvesEntry> entries,
     required bool enableBin,
   }) async {
+    final writable = excludeRemoteReadOnly(context, entries);
+    if (writable == null) return false;
+    entries = writable;
+
     final pureTrash = entries.every((entry) => entry.trashed);
     if (enableBin && !pureTrash) {
       return await doMove(context, moveType: MoveType.toBin, entries: entries);

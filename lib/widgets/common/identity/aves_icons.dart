@@ -360,6 +360,8 @@ class IconUtils {
             : null;
       case .vault:
         return buildIcon(vaults.isLocked(albumPath) ? AIcons.locked : AIcons.unlocked);
+      case .nextcloud:
+        return buildIcon(AIcons.nextcloud);
       case .regular:
         return null;
     }

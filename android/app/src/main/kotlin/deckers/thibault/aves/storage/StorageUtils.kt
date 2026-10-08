@@ -77,6 +77,9 @@ object StorageUtils {
 
     fun isInVault(context: Context, anyPath: String) = anyPath.startsWith(getVaultRoot(context))
 
+    // app-private root of the local mirror of Nextcloud accounts: `<filesDir>/nextcloud/<accountId>/<remote path>`
+    fun getNextcloudMirrorRoot(context: Context) = ensureTrailingSeparator(File(context.filesDir, "nextcloud").path)
+
     fun getAvesAppDirectories(context: Context): Set<String> {
         return hashSetOf<File>().apply {
             // /storage/{volume}/Android/data/{aves_application_id}/files

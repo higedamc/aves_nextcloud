@@ -28,6 +28,7 @@ class StorageHandler(private val context: Context) : MethodCallHandler {
             "getUntrackedTrashPaths" -> ioScope.launch { safe(call, result, ::getUntrackedTrashPaths) }
             "getUntrackedVaultPaths" -> ioScope.launch { safe(call, result, ::getUntrackedVaultPaths) }
             "getVaultRoot" -> ioScope.launch { safe(call, result, ::getVaultRoot) }
+            "getNextcloudMirrorRoot" -> ioScope.launch { safe(call, result, ::getNextcloudMirrorRoot) }
             "getFreeSpace" -> ioScope.launch { safe(call, result, ::getFreeSpace) }
             "deleteEmptyDirectories" -> ioScope.launch { safe(call, result, ::deleteEmptyDirectories) }
             "deleteTempDirectory" -> ioScope.launch { safe(call, result, ::deleteTempDirectory) }
@@ -155,6 +156,10 @@ class StorageHandler(private val context: Context) : MethodCallHandler {
 
     private fun getVaultRoot(@Suppress("unused_parameter") call: MethodCall, result: MethodChannel.Result) {
         result.success(StorageUtils.getVaultRoot(context))
+    }
+
+    private fun getNextcloudMirrorRoot(@Suppress("unused_parameter") call: MethodCall, result: MethodChannel.Result) {
+        result.success(StorageUtils.getNextcloudMirrorRoot(context))
     }
 
     private fun getFreeSpace(call: MethodCall, result: MethodChannel.Result) {

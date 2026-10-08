@@ -276,5 +276,6 @@ class SourceEntry {
         const val ORIGIN_UNKNOWN_CONTENT = 1
         const val ORIGIN_FILE = 2
         const val ORIGIN_VAULT = 3
+        const val ORIGIN_NEXTCLOUD = 4
     }
 }

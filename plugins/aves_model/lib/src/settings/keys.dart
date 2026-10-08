@@ -33,6 +33,9 @@ class SettingKeys {
   static const entryRenamingPatternKey = 'entry_renaming_pattern';
   static const topEntryIdsKey = 'top_entry_ids';
 
+  // nextcloud
+  static const nextcloudAccountsKey = 'nextcloud_accounts';
+
   // history
   static const saveSearchHistoryKey = 'save_search_history';
   static const searchHistoryKey = 'search_history';

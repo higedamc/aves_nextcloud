@@ -85,9 +85,10 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   }
 
   @override
-  Future<List<NextcloudRemoteItem>> listCollection(String relativePath) async {
-    final path = _normalize(relativePath);
-    final items = await _propfind(path, depth: 1);
+  Future<List<NextcloudRemoteItem>> listCollection(String relativePath) async => _listCollection(_normalize(relativePath), null);
+
+  Future<List<NextcloudRemoteItem>> _listCollection(String path, NextcloudItemFailureCallback? onItemFailure) async {
+    final items = await _propfind(path, depth: 1, onItemFailure: onItemFailure);
     return items.where((item) => item.relativePath != path).toList();
   }
 
@@ -107,6 +108,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     String relativePath, {
     Map<String, String> knownCollectionEtags = const {},
     void Function(NextcloudRemoteItem collection)? onCollection,
+    NextcloudItemFailureCallback? onItemFailure,
     NextcloudCancellation? cancellation,
   }) async* {
     final root = _normalize(relativePath);
@@ -115,7 +117,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     if (info.supportsSearch) {
       List<NextcloudRemoteItem>? snapshot;
       try {
-        snapshot = await _searchMediaTree(root, cancellation);
+        snapshot = await _searchMediaTree(root, onItemFailure, cancellation);
       } on NextcloudAuthFailure {
         rethrow;
       } on NextcloudCancelledFailure {
@@ -137,10 +139,10 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       }
     }
 
-    yield* _crawlMediaTree(root, knownCollectionEtags, onCollection, cancellation);
+    yield* _crawlMediaTree(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
   }
 
-  Future<List<NextcloudRemoteItem>> _searchMediaTree(String root, NextcloudCancellation? cancellation) async {
+  Future<List<NextcloudRemoteItem>> _searchMediaTree(String root, NextcloudItemFailureCallback? onItemFailure, NextcloudCancellation? cancellation) async {
     final scopeHref = NextcloudPaths.join('/files/${account.username}', NextcloudPaths.join(account.rootFolder, root));
     final results = <NextcloudRemoteItem>[];
     final seen = <String>{};
@@ -154,19 +156,23 @@ class WebDavNextcloudRepository implements NextcloudRepository {
         body: body,
         relativePath: root,
       );
-      final items = MultistatusParser.parse(response.body, rootHref: account.rootHref);
+      final parsed = MultistatusParser.parsePage(response.body, rootHref: account.rootHref, onItemFailure: onItemFailure);
       var added = 0;
-      for (final item in items) {
+      for (final item in parsed.items) {
         if (item.isCollection || !item.isMedia) continue;
         if (!_isUnder(item.relativePath, root)) {
-          throw NextcloudPathEscapeFailure(item.relativePath);
+          _reportOrThrow(onItemFailure, item.relativePath, NextcloudPathEscapeFailure(item.relativePath));
+          continue;
         }
         if (seen.add(item.relativePath)) {
           results.add(item);
           added++;
         }
       }
-      if (items.length < searchPageSize || added == 0) break;
+      // a short page is the last one; the response count is used rather than the item count because a page
+      // can have holes (skipped hrefs, responses without a successful propstat) and still be full.
+      // `added == 0` on a full page means the server ignored the offset: stop rather than loop forever.
+      if (parsed.responseCount < searchPageSize || added == 0) break;
     }
     return results;
   }
@@ -175,9 +181,11 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     String root,
     Map<String, String> knownCollectionEtags,
     void Function(NextcloudRemoteItem collection)? onCollection,
+    NextcloudItemFailureCallback? onItemFailure,
     NextcloudCancellation? cancellation,
   ) async* {
     _checkCancelled(cancellation);
+    // the root is listed strictly: if it cannot be listed, there is no tree to sync
     final rootItem = await stat(root);
     if (!rootItem.isCollection) {
       throw NextcloudNotFoundFailure(root);
@@ -192,10 +200,20 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     while (pending.isNotEmpty) {
       _checkCancelled(cancellation);
       final dir = pending.removeAt(0);
-      final children = await listCollection(dir);
+      final List<NextcloudRemoteItem> children;
+      try {
+        children = await _listCollection(dir, onItemFailure);
+      } on NextcloudFailure catch (e) {
+        if (dir == root || onItemFailure == null || !_isItemLevel(e)) rethrow;
+        // one sub-folder the server refuses (403 on a share without permission, 404 on a folder removed
+        // meanwhile, a 5xx, a garbled body) must not stop the sync of everything else
+        onItemFailure(dir, e);
+        continue;
+      }
       for (final child in children) {
         if (!_isUnder(child.relativePath, dir)) {
-          throw NextcloudPathEscapeFailure(child.relativePath);
+          _reportOrThrow(onItemFailure, child.relativePath, NextcloudPathEscapeFailure(child.relativePath));
+          continue;
         }
         if (child.isCollection) {
           onCollection?.call(child);
@@ -272,7 +290,7 @@ class WebDavNextcloudRepository implements NextcloudRepository {
 
   // request plumbing
 
-  Future<List<NextcloudRemoteItem>> _propfind(String path, {required int depth}) async {
+  Future<List<NextcloudRemoteItem>> _propfind(String path, {required int depth, NextcloudItemFailureCallback? onItemFailure}) async {
     final response = await _send(
       'PROPFIND',
       account.filesUrl(path),
@@ -280,8 +298,19 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       body: DavRequests.propfindBody,
       relativePath: path,
     );
-    return MultistatusParser.parse(response.body, rootHref: account.rootHref);
+    return MultistatusParser.parsePage(response.body, rootHref: account.rootHref, onItemFailure: onItemFailure).items;
   }
+
+  static void _reportOrThrow(NextcloudItemFailureCallback? onItemFailure, String path, NextcloudFailure failure) {
+    if (onItemFailure == null) throw failure;
+    onItemFailure(path, failure);
+  }
+
+  // failures that concern one item or sub-tree rather than the account, the connection or the whole listing
+  static bool _isItemLevel(NextcloudFailure failure) => switch (failure) {
+    NextcloudServerFailure() || NextcloudNotFoundFailure() || NextcloudParseFailure() || NextcloudPathEscapeFailure() || NextcloudDepthRefusedFailure() => true,
+    _ => false,
+  };
 
   http.Request _request(String method, Uri url, {Map<String, String>? headers, String? body}) {
     final request = http.Request(method, url)
@@ -329,7 +358,10 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     if (status == 401) throw NextcloudAuthFailure(status);
     if (status == 403) {
       if (body != null && body.contains('propfind-finite-depth')) throw const NextcloudDepthRefusedFailure();
-      throw NextcloudAuthFailure(status);
+      // Nextcloud answers an expired or wrong app password with 401; 403 is per resource (a share without
+      // permission, an access-control app, a lock), so it is not an authentication failure and re-entering
+      // the password would not fix it
+      throw NextcloudServerFailure(status, 'access denied');
     }
     if (status == 404) throw NextcloudNotFoundFailure(relativePath);
     if (status >= 300 && status < 400) {

@@ -28,7 +28,8 @@ class RecordingDb extends FakeAvesDb {
   final List<(int, AvesEntry)> updates = [];
   final List<(Set<int>, Set<EntryDataType>?)> removals = [];
 
-  void reset() {
+  // not `reset()`: `LocalMediaDb.reset()` exists with a different signature
+  void clearRecords() {
     rows.clear();
     inserts.clear();
     updates.clear();
@@ -57,6 +58,8 @@ class RecordingDb extends FakeAvesDb {
     rows[entry.id] = entry;
   }
 
+  // only `basic` (or no filter) drops the row, as in sqflite: `AvesEntry.refresh` removes the id first and
+  // `applyNewFields` writes it back with `updateEntry`, so a refresh must not lose the row in between
   @override
   Future<void> removeIds(Set<int> ids, {Set<EntryDataType>? dataTypes}) async {
     if (ids.isEmpty) return;
@@ -94,7 +97,8 @@ void main() {
     isCollection: false,
   );
 
-  // the same modification date everywhere, so a refresh does not take the "image changed" path (decoder cache)
+  // the same modification date everywhere: a refresh that sees a changed date calls `clearDecoders()`,
+  // which the fake services do not implement, so this is what keeps a refresh on the fake-safe path
   AvesEntry entryAt(String localPath, {required int id, required int origin, int sizeBytes = 42}) => AvesEntry(
     id: id,
     uri: Uri.file(localPath).toString(),
@@ -133,6 +137,8 @@ void main() {
   Iterable<AvesEntry> inCollection(String uri) => source.allEntries.where((entry) => entry.uri == uri);
 
   setUpAll(() async {
+    // `refreshEntries` reads `settings.avesLocale`, which falls back to the platform locales via `WidgetsBinding.instance`
+    TestWidgetsFlutterBinding.ensureInitialized();
     await setUpAllServices();
     // `localMediaDb` resolves its singleton on first use, which has not happened yet
     getIt.unregister<LocalMediaDb>();
@@ -142,9 +148,8 @@ void main() {
 
   setUp(() async {
     await setUpServices();
-    db.reset();
-    await favourites.clear();
-    await covers.clear();
+    db.clearRecords();
+    // favourites and covers are already empty: `MediaStoreSource.init` reloads both from the fake DB (`{}`)
     (mediaFetchService as FakeMediaFetchService).entries = {};
   });
 

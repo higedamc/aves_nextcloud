@@ -200,7 +200,12 @@ mixin _NextcloudAccountOps on FeedbackMixin {
       await reportService.recordError(e, stack);
       done = false;
     }
-    if (!done && context.mounted) {
+    if (!context.mounted) return;
+    if (done) {
+      // Nextcloud album names depend on the account list (a root album is named after its account only when
+      // there are several), so the source's cached names are stale or wrong after any account change
+      context.read<CollectionSource>().invalidateStoredAlbumDisplayNames();
+    } else {
       showFeedback(context, FeedbackType.warn, l10n.genericFailureFeedback);
     }
   }

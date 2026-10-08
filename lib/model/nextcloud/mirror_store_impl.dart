@@ -119,7 +119,9 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   @override
   Future<int> usedBytes(NextcloudAccount account) => _index.sumSizeBytes(account);
 
-  // one page of eviction candidates; removing them brings up the next page in the same order
+  // one page of eviction candidates; removing them brings up the next page in the same order.
+  // A page that is entirely undeletable stops eviction, so this is also the number of consecutive
+  // undeletable rows at the head of the LRU order that can hide the rest of the queue.
   static const _evictionPageSize = 256;
 
   @override
@@ -140,8 +142,16 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
         try {
           await remove(account, victim.relativePath);
         } catch (_) {
-          // a file the platform refuses to delete must not cost the caller the paths already evicted:
-          // it stays accounted for, and the next candidate is tried instead
+          // `remove` deletes the file before the row, so a failure here means either that nothing went,
+          // or that the bytes are already gone and only the row stayed. The second case must still be
+          // reported: the caller drops the collection entry for every path returned here, and an entry
+          // left pointing at a deleted file is exactly the `entry.refresh` trap the contract warns about.
+          if (await _bytesAreGone(account, victim.relativePath)) {
+            evicted.add(victim.relativePath);
+          }
+          // `used` and `removedFromPage` deliberately stay put, even in that case: the row is still at
+          // the head of the LRU order, so counting this as progress would re-query the same page forever.
+          // Leaving the row also keeps its bytes accounted for, which only ever evicts more than needed.
           continue;
         }
         evicted.add(victim.relativePath);
@@ -178,6 +188,16 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     final normalized = NextcloudPaths.normalize(relativePath);
     if (normalized == null) throw NextcloudPathEscapeFailure(relativePath);
     return normalized;
+  }
+
+  // after a failed `remove`: are the bytes gone even though the row stayed?
+  Future<bool> _bytesAreGone(NextcloudAccount account, String relativePath) async {
+    try {
+      return !await File(localPathFor(account, relativePath)).exists();
+    } catch (_) {
+      // the path does not even resolve, so nothing was deleted under it
+      return false;
+    }
   }
 
   Future<void> _deleteFile(String path) async {

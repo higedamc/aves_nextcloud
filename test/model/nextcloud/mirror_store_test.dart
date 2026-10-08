@@ -293,19 +293,34 @@ void main() {
       expect(await File(store.localPathFor(b, 'b.jpg')).exists(), isTrue);
     });
 
-    test('still reports what it evicted when one removal fails', () async {
+    test('still reports what it evicted when one row deletion fails', () async {
       final account = accountWith(cacheLimitBytes: 0);
       await recordWritten(account, 'stuck.jpg', 10, lastAccessAt: epoch);
       await recordWritten(account, 'ok.jpg', 10, lastAccessAt: epoch.add(const Duration(days: 1)));
-      // the oldest item is the one that cannot go, so a propagating failure would hide both
+      // the oldest item is the one whose row cannot go, so a propagating failure would hide both
       index.failDeleteFor.add('stuck.jpg');
 
       final evicted = await store.evictToFit(account);
 
-      expect(evicted, {'ok.jpg'});
-      // the one that stayed is still accounted for, so it is not leaked
+      // `remove` deletes the file before the row, so `stuck.jpg`'s bytes went even though its row
+      // stayed. It has to be reported: the caller drops its collection entry from this set, and an
+      // entry pointing at a file that is gone is the `entry.refresh` trap.
+      expect(evicted, {'ok.jpg', 'stuck.jpg'});
+      expect(await File(store.localPathFor(account, 'stuck.jpg')).exists(), isFalse);
+      // the row stays, so the bytes stay accounted for: over-reporting only ever evicts more
       expect(await store.lookup(account, 'stuck.jpg'), isNotNull);
       expect(await store.usedBytes(account), 10);
+    });
+
+    test('reports a row whose file was already missing', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      // a row with no file on disk: nothing to delete, and the row deletion then fails
+      await writeMirrorFile(account, 'ghost.jpg', 10);
+      await store.record(account, entryFor('ghost.jpg', sizeBytes: 10));
+      await File(store.localPathFor(account, 'ghost.jpg')).delete();
+      index.failDeleteFor.add('ghost.jpg');
+
+      expect(await store.evictToFit(account), {'ghost.jpg'});
     });
 
     test('stops instead of looping when nothing on the page can go', () async {
@@ -313,8 +328,11 @@ void main() {
       await recordWritten(account, 'stuck.jpg', 10);
       index.failDeleteFor.add('stuck.jpg');
 
-      expect(await store.evictToFit(account), isEmpty);
+      // the path is still reported (its bytes went), but the row left at the head of the LRU order
+      // must not count as progress, or the next round would query the same page forever
+      expect(await store.evictToFit(account), {'stuck.jpg'});
       expect(index.getLeastRecentlyAccessedCalls, 1);
+      expect(await store.usedBytes(account), 10);
     });
 
     test('pages through more candidates than one query returns', () async {

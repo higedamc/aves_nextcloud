@@ -11,7 +11,6 @@ import 'package:aves/model/nextcloud/sync_ports.dart';
 import 'package:aves/model/source/collection_source.dart';
 import 'package:aves/model/source/events.dart';
 import 'package:aves/services/common/services.dart';
-import 'package:aves_model/aves_model.dart';
 
 // `NextcloudSyncSink` over the app collection (integration). A mirrored file becomes an entry the way a recovered
 // vault item does: `mediaFetchService.getEntry` on its `file://` URI, `origin = nextcloud`, inserted in the DB and
@@ -55,8 +54,14 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   Future<Map<String, int>> get _idByUri => _index ??= _loadIndex();
 
   Future<Map<String, int>> _loadIndex() async {
-    final rows = await localMediaDb.loadEntries(origin: EntryOrigins.nextcloud);
-    return {for (final row in rows) row.uri: row.id};
+    try {
+      final rows = await localMediaDb.loadEntries(origin: EntryOrigins.nextcloud);
+      return {for (final row in rows) row.uri: row.id};
+    } catch (_) {
+      // not cached, so the next call retries instead of failing every put for the rest of the session
+      _index = null;
+      rethrow;
+    }
   }
 
   void _onEntriesRemoved(EntryRemovedEvent event) {
@@ -117,7 +122,10 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   // every entry under the account's mirror, with or without an index row (used by a purge)
   Future<void> removeAccountEntries(NextcloudAccount account) async {
     final index = await _idByUri;
-    final uris = index.keys.where((uri) => _mirror.relativePathFor(account, Uri.parse(uri).toFilePath()) != null).toSet();
+    final uris = index.keys.where((uri) {
+      final parsed = Uri.parse(uri);
+      return parsed.isScheme('file') && _mirror.relativePathFor(account, parsed.toFilePath()) != null;
+    }).toSet();
     await _removeUris(uris);
   }
 

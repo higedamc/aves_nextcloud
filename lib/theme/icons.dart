@@ -166,6 +166,7 @@ class AIcons {
   static const slideshow = Symbols.slideshow;
   static const split = Symbols.call_split;
   static const stats = Symbols.donut_small;
+  static const nextcloud = Symbols.cloud;
   static const vaultLock = Symbols.lock;
   static const vaultAdd = Symbols.enhanced_encryption;
   static const vaultConfigure = MdiIcons.shieldLockOutline;

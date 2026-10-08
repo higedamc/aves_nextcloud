@@ -140,6 +140,8 @@ abstract class AvesColorsData {
 
   Color get navigation => fromHue(140);
 
+  Color get nextcloud => fromHue(198);
+
   Color get privacy => fromHue(344);
 
   Color get thumbnails => fromHue(87);

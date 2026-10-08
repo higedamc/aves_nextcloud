@@ -1012,6 +1012,20 @@
   "settingsAllowMediaManagement": "Allow media management",
   "settingsAllowNotifications": "Allow notifications",
 
+  "settingsNextcloudSectionTitle": "Nextcloud",
+  "nextcloudAccountsTile": "Accounts",
+  "nextcloudAccountsPageTitle": "Nextcloud Accounts",
+  "nextcloudAccountsPageEmpty": "No Nextcloud accounts",
+  "nextcloudAccountsPageAddAccount": "Add account",
+  "nextcloudAccountDialogAddTitle": "Add Nextcloud Account",
+  "nextcloudAccountDialogEditTitle": "Edit Nextcloud Account",
+  "nextcloudAccountDialogServerUrl": "Server URL",
+  "nextcloudAccountDialogUsername": "Username",
+  "nextcloudAccountDialogAppPassword": "App password",
+  "nextcloudAccountDialogAppPasswordKeepHint": "Leave blank to keep the current password",
+  "nextcloudAccountDialogRootFolder": "Folder to browse",
+  "nextcloudAccountDialogAllowInsecureHttp": "Allow unencrypted (http://) connection",
+
   "settingsPermissionsTile": "Permissions",
   "settingsPermissionsPageTitle": "Permissions",
 

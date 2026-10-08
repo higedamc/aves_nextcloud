@@ -292,6 +292,44 @@ void main() {
       expect(await store.listAll(b), isNotEmpty);
       expect(await File(store.localPathFor(b, 'b.jpg')).exists(), isTrue);
     });
+
+    test('still reports what it evicted when one removal fails', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      await recordWritten(account, 'stuck.jpg', 10, lastAccessAt: epoch);
+      await recordWritten(account, 'ok.jpg', 10, lastAccessAt: epoch.add(const Duration(days: 1)));
+      // the oldest item is the one that cannot go, so a propagating failure would hide both
+      index.failDeleteFor.add('stuck.jpg');
+
+      final evicted = await store.evictToFit(account);
+
+      expect(evicted, {'ok.jpg'});
+      // the one that stayed is still accounted for, so it is not leaked
+      expect(await store.lookup(account, 'stuck.jpg'), isNotNull);
+      expect(await store.usedBytes(account), 10);
+    });
+
+    test('stops instead of looping when nothing on the page can go', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      await recordWritten(account, 'stuck.jpg', 10);
+      index.failDeleteFor.add('stuck.jpg');
+
+      expect(await store.evictToFit(account), isEmpty);
+      expect(index.getLeastRecentlyAccessedCalls, 1);
+    });
+
+    test('pages through more candidates than one query returns', () async {
+      // 300 rows against a 256-row page: a single page cannot bring the account under the limit
+      final account = accountWith(cacheLimitBytes: 0);
+      for (var i = 0; i < 300; i++) {
+        await recordWritten(account, 'photo$i.jpg', 1, lastAccessAt: epoch.add(Duration(minutes: i)));
+      }
+
+      final evicted = await store.evictToFit(account);
+
+      expect(evicted.length, 300);
+      expect(await store.usedBytes(account), 0);
+      expect(index.getLeastRecentlyAccessedCalls, greaterThan(1));
+    });
   });
 
   group('purge', () {
@@ -320,6 +358,30 @@ void main() {
 
     test('succeeds for an account that never mirrored anything', () async {
       await expectLater(store.purge(accountWith(id: 'acc3')), completes);
+    });
+
+    test('drops the rows even when the directory cannot be deleted', () async {
+      final account = accountWith();
+      await recordWritten(account, 'a.jpg', 10);
+      // make the mirror root unwritable so the account directory cannot be unlinked
+      await Process.run('chmod', ['500', tempDir.path]);
+      addTearDown(() => Process.run('chmod', ['700', tempDir.path]));
+
+      var deleteFailed = false;
+      try {
+        await store.purge(account);
+      } on FileSystemException {
+        deleteFailed = true;
+      }
+
+      if (!deleteFailed) {
+        // running as a user that ignores the mode bits; the premise of this test does not hold here
+        markTestSkipped('the directory delete succeeded despite mode 500');
+        return;
+      }
+      // rows claiming files that may be gone must not outlive the account
+      expect(await store.listAll(account), isEmpty);
+      expect(await store.usedBytes(account), 0);
     });
   });
 }

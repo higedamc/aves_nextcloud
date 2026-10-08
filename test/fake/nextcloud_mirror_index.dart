@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/mirror_index.dart';
 import 'package:aves/model/nextcloud/mirror_store.dart';
@@ -8,6 +10,11 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   final Map<String, Map<String, NextcloudMirrorIndexEntry>> _byAccount = {};
 
   int initCount = 0;
+
+  // paths whose row deletion fails, to exercise a platform that refuses to drop an entry
+  final Set<String> failDeleteFor = {};
+
+  int getLeastRecentlyAccessedCalls = 0;
 
   @override
   Future<void> init() async => initCount++;
@@ -21,17 +28,21 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   Future<Set<NextcloudMirrorIndexEntry>> getAll(NextcloudAccount account) async => _rows(account).values.toSet();
 
   @override
-  Future<List<NextcloudMirrorIndexEntry>> getAllByLeastRecentlyAccessed(NextcloudAccount account) async {
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
+    getLeastRecentlyAccessedCalls++;
     final entries = _rows(account).values.toList();
     entries.sort((a, b) => a.lastAccessAt.compareTo(b.lastAccessAt));
-    return entries;
+    return entries.take(limit).toList();
   }
 
   @override
   Future<void> put(NextcloudAccount account, NextcloudMirrorIndexEntry entry) async => _rows(account)[entry.relativePath] = entry;
 
   @override
-  Future<void> delete(NextcloudAccount account, String relativePath) async => _rows(account).remove(relativePath);
+  Future<void> delete(NextcloudAccount account, String relativePath) async {
+    if (failDeleteFor.contains(relativePath)) throw const FileSystemException('refused');
+    _rows(account).remove(relativePath);
+  }
 
   @override
   Future<void> deleteAll(NextcloudAccount account) async => _rows(account).clear();

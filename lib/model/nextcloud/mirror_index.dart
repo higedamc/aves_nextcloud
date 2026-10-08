@@ -15,8 +15,9 @@ abstract class NextcloudMirrorIndex {
 
   Future<Set<NextcloudMirrorIndexEntry>> getAll(NextcloudAccount account);
 
-  // Least-recently-accessed first. Used by eviction, which must not load the whole account to pick victims.
-  Future<List<NextcloudMirrorIndexEntry>> getAllByLeastRecentlyAccessed(NextcloudAccount account);
+  // Least-recently-accessed first, at most `limit` rows. Eviction pages through this instead of
+  // loading the whole account: a large library can hold a six-figure number of rows.
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit});
 
   // Inserts or replaces the row for `entry.relativePath`.
   Future<void> put(NextcloudAccount account, NextcloudMirrorIndexEntry entry);

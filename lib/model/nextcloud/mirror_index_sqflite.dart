@@ -60,8 +60,9 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
   }
 
   @override
-  Future<List<NextcloudMirrorIndexEntry>> getAllByLeastRecentlyAccessed(NextcloudAccount account) async {
-    final rows = await _db.query(table, where: 'accountId = ?', whereArgs: [account.id], orderBy: 'lastAccessAt ASC');
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
+    // served by the `lastAccessAt` index, so a page costs the page, not the account
+    final rows = await _db.query(table, where: 'accountId = ?', whereArgs: [account.id], orderBy: 'lastAccessAt ASC', limit: limit);
     return rows.map(_toEntry).toList();
   }
 

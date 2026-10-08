@@ -119,6 +119,9 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   @override
   Future<int> usedBytes(NextcloudAccount account) => _index.sumSizeBytes(account);
 
+  // one page of eviction candidates; removing them brings up the next page in the same order
+  static const _evictionPageSize = 256;
+
   @override
   Future<Set<String>> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
     final budget = account.cacheLimitBytes - reserveBytes;
@@ -126,14 +129,27 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
 
     var used = await _index.sumSizeBytes(account);
     final evicted = <String>{};
-    if (used <= target) return evicted;
 
-    final victims = await _index.getAllByLeastRecentlyAccessed(account);
-    for (final victim in victims) {
-      if (used <= target) break;
-      await remove(account, victim.relativePath);
-      evicted.add(victim.relativePath);
-      used -= victim.sizeBytes;
+    while (used > target) {
+      final victims = await _index.getLeastRecentlyAccessed(account, limit: _evictionPageSize);
+      if (victims.isEmpty) break;
+
+      var removedFromPage = 0;
+      for (final victim in victims) {
+        if (used <= target) break;
+        try {
+          await remove(account, victim.relativePath);
+        } catch (_) {
+          // a file the platform refuses to delete must not cost the caller the paths already evicted:
+          // it stays accounted for, and the next candidate is tried instead
+          continue;
+        }
+        evicted.add(victim.relativePath);
+        used -= victim.sizeBytes;
+        removedFromPage++;
+      }
+      // nothing on this page could go, so the next page would be the same one
+      if (removedFromPage == 0) break;
     }
     // `used > target` here means even an empty mirror cannot hold the reservation; the caller decides
     // whether that is a `NextcloudQuotaFailure`. Everything evicted is reported either way.
@@ -143,10 +159,15 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   @override
   Future<void> purge(NextcloudAccount account) async {
     final directory = Directory(_accountRoot(account));
-    if (await directory.exists()) {
-      await directory.delete(recursive: true);
+    try {
+      if (await directory.exists()) {
+        await directory.delete(recursive: true);
+      }
+    } finally {
+      // the rows go even when the directory does not: an account is purged on its way out, and rows
+      // claiming files that are gone would make a later account reusing this id skip real downloads
+      await _index.deleteAll(account);
     }
-    await _index.deleteAll(account);
   }
 
   void _checkInitialized() {

@@ -102,7 +102,7 @@ class Nextcloud {
         notifier.value = NextcloudSyncStatus(progress: progress, lastResult: notifier.value.lastResult);
       }
       final result = await resultFuture;
-      _sink?.flushAnalysis();
+      _sink?.flush();
       notifier.value = NextcloudSyncStatus(lastResult: result);
       unawaited(reportService.log('Nextcloud sync ${account.id}: $result'));
       return result;

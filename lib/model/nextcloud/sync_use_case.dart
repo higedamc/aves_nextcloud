@@ -21,7 +21,10 @@ import 'package:aves/model/nextcloud/sync_ports.dart';
 //   re-downloaded when the listing emits it and dropped (row and entry) otherwise.
 // - A path reported through `onItemFailure` was not enumerated. Nothing under it is treated as removed.
 // - Collection etags are persisted only after a run that ends without a fatal failure, merged over the
-//   previous map; `force` and a raised cache limit list everything again.
+//   previous map; `force` and a raised cache limit list everything again. Merging (and the unchanged-root
+//   fast path) rests on Nextcloud propagating every etag change to all ancestors: a persisted etag means
+//   "this subtree was fully enumerated when it had this etag", which only stays true because any later
+//   change under it bumps it. Against a WebDAV server that does not propagate, this is silently stale.
 // - Downloads go newest first, within the cache budget. When making room would evict a file downloaded in
 //   this run, the remaining (older) files are counted as skipped rather than thrashing the cache.
 class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
@@ -336,10 +339,18 @@ class _Listing {
     if (known[path] == collection.etag) skipped.add(path);
   }
 
-  // whether the listing would have emitted `path` if it still existed on the server
-  bool isEnumerated(String path) => !skipped.any((dir) => _isUnder(path, dir)) && !reported.any((prefix) => _isUnder(path, prefix));
-
-  static bool _isUnder(String path, String prefix) => prefix.isEmpty || path == prefix || path.startsWith('$prefix${NextcloudPaths.separator}');
+  // whether the listing would have emitted `path` if it still existed on the server: true unless `path` or
+  // one of its ancestors (up to and including the root, '') was skipped or reported. Walks ancestors with set
+  // lookups rather than scanning the sets, because on an ordinary incremental run nearly every collection is
+  // skipped and nearly every row is not emitted.
+  bool isEnumerated(String path) {
+    var current = path;
+    while (true) {
+      if (skipped.contains(current) || reported.contains(current)) return false;
+      if (current.isEmpty) return true;
+      current = NextcloudPaths.parentOf(current);
+    }
+  }
 }
 
 class _Stats {

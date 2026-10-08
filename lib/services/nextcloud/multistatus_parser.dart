@@ -12,8 +12,9 @@ import 'package:xml/xml.dart';
 // `rootHref` is the unencoded root href of the account (`NextcloudAccount.rootHref`), so every
 // returned `relativePath` is relative to the account root folder. An href that cannot be mapped
 // inside that root is a `NextcloudPathEscapeFailure`: with `onItemFailure` the response is reported
-// and skipped, without it the failure is thrown. A document that is not a multistatus at all is
-// always a thrown `NextcloudParseFailure`: nothing in it can be trusted.
+// and skipped, without it the failure is thrown. A response without a successful propstat is reported
+// with `onItemFailure` and skipped either way. A document that is not a multistatus at all is always
+// a thrown `NextcloudParseFailure`: nothing in it can be trusted.
 typedef MultistatusPage = ({List<NextcloudRemoteItem> items, int responseCount});
 
 class MultistatusParser {
@@ -53,12 +54,20 @@ class MultistatusParser {
 
       final prop = _okProp(response);
       if (prop == null) {
-        // no successful propstat (e.g. all requested props are 404): nothing usable
+        // no successful propstat (every requested prop is 404, or the props are forbidden): nothing usable.
+        // Reported so a crawl knows the folder was not fully enumerated; without a callback the response
+        // is skipped as before, since nothing in it threatens the rest of the document.
+        onItemFailure?.call(relativePath, NextcloudParseFailure('no successful propstat for $relativePath: ${_propstatStatuses(response)}'));
         continue;
       }
       items.add(_toItem(prop, relativePath));
     }
     return (items: items, responseCount: responseCount);
+  }
+
+  static String _propstatStatuses(XmlElement response) {
+    final statuses = response.findElements('propstat', namespace: DavNamespaces.dav).map((v) => v.getElement('status', namespace: DavNamespaces.dav)?.innerText.trim()).whereType<String>().toList();
+    return statuses.isEmpty ? 'no propstat' : statuses.join(', ');
   }
 
   static XmlElement? _okProp(XmlElement response) {

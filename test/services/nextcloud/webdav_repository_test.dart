@@ -52,6 +52,17 @@ String _file(String href, String etag, {String mime = 'image/jpeg', int fileId =
     </d:propstat>
   </d:response>''';
 
+// a response the server cannot describe: no successful propstat
+String _unreadable(String href) =>
+    '''
+  <d:response>
+    <d:href>$href</d:href>
+    <d:propstat>
+      <d:prop><d:getetag/><d:getcontenttype/></d:prop>
+      <d:status>HTTP/1.1 403 Forbidden</d:status>
+    </d:propstat>
+  </d:response>''';
+
 String _multistatus(List<String> responses) => '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">${responses.join()}</d:multistatus>';
 
 const _davFiles = '/remote.php/dav/files/alice/Photos';
@@ -74,12 +85,21 @@ class _Server {
   // an extra file response injected into the root listing and the SEARCH result
   String? injectedHref;
 
+  // a raw response injected into the root listing
+  String? injectedRootResponse;
+
   new({this.supportsSearch = true});
 
   String _withInjected(String body) {
     final href = injectedHref;
     if (href == null) return body;
     return body.replaceFirst('</d:multistatus>', '${_file(href, 'x-v1', fileId: 9)}</d:multistatus>');
+  }
+
+  String _withInjectedRoot(String body) {
+    final response = injectedRootResponse;
+    if (response == null) return body;
+    return body.replaceFirst('</d:multistatus>', '$response</d:multistatus>');
   }
 
   Future<http.Response> handle(http.Request request) async {
@@ -122,7 +142,7 @@ class _Server {
           final selfOnly = _multistatus([_collection(key, key == '$_davFiles/' ? 'root-v1' : 'sub-v1')]);
           return http.Response(selfOnly, 207);
         }
-        return http.Response(key == '$_davFiles/' ? _withInjected(body) : body, 207);
+        return http.Response(key == '$_davFiles/' ? _withInjectedRoot(_withInjected(body)) : body, 207);
       case 'SEARCH':
         expect(path, '/remote.php/dav/');
         expect(request.body, contains('<d:href>/files/alice/Photos</d:href>'));
@@ -191,7 +211,10 @@ void main() {
     for (final supportsSearch in [true, false]) {
       final server = _Server(supportsSearch: supportsSearch)..injectedHref = escaped;
       final failures = <String, NextcloudFailure>{};
-      final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+      final collections = <NextcloudRemoteItem>[];
+      final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
+      // the bad href sits in the root listing: the root stays unpublished, the clean sub-folders do not
+      expect(collections.map((v) => v.relativePath), supportsSearch ? isEmpty : ['Sub/Deep', 'Sub'], reason: 'search=$supportsSearch');
       // the SEARCH fixture is a static two-item snapshot; the crawl walks the full three-level tree
       expect(items.map((v) => v.relativePath), supportsSearch ? ['a.jpg', 'Sub/b.mp4'] : ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg'], reason: 'search=$supportsSearch');
       expect(failures.keys, [escaped]);
@@ -237,6 +260,51 @@ void main() {
     final again = <NextcloudRemoteItem>[];
     await _repo(healed).listMediaTree('', onCollection: again.add).toList();
     expect(again.map((v) => v.relativePath), ['Sub/Deep', 'Sub', '']);
+  });
+
+  test('a file the server cannot describe leaves its folder unpublished, so it is retried next time', () async {
+    final server = _Server(supportsSearch: false)..injectedRootResponse = _unreadable('$_davFiles/locked.jpg');
+    final failures = <String, NextcloudFailure>{};
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
+    expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']);
+    expect(failures.keys, ['locked.jpg']);
+    expect(failures['locked.jpg'], isA<NextcloudParseFailure>().having((e) => e.toString(), 'message', contains('403')));
+    // one response of the root listing was unusable: the root is not "fully enumerated", its sub-folders are
+    expect(collections.map((v) => v.relativePath), ['Sub/Deep', 'Sub']);
+
+    // without a callback the response is skipped and the listing is not failed (the public listCollection contract)
+    expect((await _repo(server).listCollection('')).map((v) => v.relativePath), ['a.jpg', 'notes.txt', 'Sub']);
+  });
+
+  test('stops descending at the depth cap and reports the folder instead of overflowing', () async {
+    // a server with a collection nested without end: Photos/n/n/n/...
+    final client = MockClient((request) async {
+      switch (request.method) {
+        case 'OPTIONS':
+          return http.Response('', 200, headers: {'Allow': 'OPTIONS, PROPFIND'});
+        case 'GET':
+          return http.Response('{}', 200);
+        case 'PROPFIND':
+          final path = request.url.path.endsWith('/') ? request.url.path : '${request.url.path}/';
+          final self = _collection(path, 'v');
+          return http.Response(_multistatus(request.headers['depth'] == '0' ? [self] : [self, _collection('${path}n/', 'v')]), 207);
+      }
+      return http.Response('', 405);
+    });
+    final repo = WebDavNextcloudRepository(_account, _credentials, client: client);
+    final failures = <String, NextcloudFailure>{};
+    final collections = <NextcloudRemoteItem>[];
+    final items = await repo.listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
+    expect(items, isEmpty);
+    final deepest = List.filled(WebDavNextcloudRepository.maxCrawlDepth + 1, 'n').join('/');
+    expect(failures.keys, [deepest]);
+    expect(failures[deepest], isA<NextcloudParseFailure>());
+    // nothing above the cap is complete, so nothing is published and the next crawl tries again
+    expect(collections, isEmpty);
+
+    // without a callback the cap is a thrown failure
+    await expectLater(WebDavNextcloudRepository(_account, _credentials, client: client).listMediaTree('').toList(), throwsA(isA<NextcloudParseFailure>()));
   });
 
   test('SEARCH paging keeps going past a full page of holes but stops when the server ignores the offset', () async {

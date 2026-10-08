@@ -152,5 +152,11 @@ void main() {
     expect(MultistatusParser.parse(body, rootHref: _root), isEmpty);
     // the response still counts towards the page size
     expect(MultistatusParser.parsePage(body, rootHref: _root).responseCount, 1);
+    // and is reported when there is someone to tell, so a crawl knows the folder was not fully enumerated
+    final failures = <String, NextcloudFailure>{};
+    final page = MultistatusParser.parsePage(body, rootHref: _root, onItemFailure: (path, failure) => failures[path] = failure);
+    expect(page.items, isEmpty);
+    expect(failures.keys, ['gone.jpg']);
+    expect(failures['gone.jpg'], isA<NextcloudParseFailure>().having((e) => e.toString(), 'message', contains('404')));
   });
 }

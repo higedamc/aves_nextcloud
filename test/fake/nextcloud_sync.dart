@@ -271,7 +271,7 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   Future<int> usedBytes(NextcloudAccount account) async => rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
 
   @override
-  Future<Set<String>> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
+  Future<NextcloudEvictionOutcome> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
     evictCalls.add('${account.id}:$reserveBytes');
     final target = (account.cacheLimitBytes - reserveBytes).clamp(0, account.cacheLimitBytes);
     final evicted = <String>{};
@@ -288,7 +288,8 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       evicted.add(victim.relativePath);
       used -= victim.localSizeBytes;
     }
-    return evicted;
+    // no demotions: this fake mirrors the real store, which has no cheaper tier to fall back to yet
+    return NextcloudEvictionOutcome(removed: evicted);
   }
 
   @override
@@ -307,6 +308,10 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
   // tier each put was made at, so a test can assert what the sync claimed the bytes were
   final Map<String, NextcloudMirrorTier> putTiers = {};
 
+  // paths put with no local bytes; deliberately a separate list, because the whole point of the separate
+  // port method is that a placeholder and a mirrored file cannot be confused for one another
+  final List<String> placeholders = [];
+
   Set<String> get removed => removals.expand((v) => v).toSet();
 
   @override
@@ -315,6 +320,13 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
     if (!await File(localPath).exists()) throw StateError('put before the file was written: $localPath');
     puts.add(item.relativePath);
     putTiers[item.relativePath] = tier;
+    return true;
+  }
+
+  @override
+  Future<bool> putPlaceholder(NextcloudAccount account, NextcloudRemoteItem item) async {
+    if (putFails.contains(item.relativePath)) return false;
+    placeholders.add(item.relativePath);
     return true;
   }
 

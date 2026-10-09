@@ -6,6 +6,7 @@ import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/favourites.dart';
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/mirror_store.dart';
+import 'package:aves/model/nextcloud/placeholder_entries.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 import 'package:aves/model/nextcloud/sync_ports.dart';
 import 'package:aves/model/source/collection_source.dart';
@@ -18,6 +19,9 @@ import 'package:aves/services/common/services.dart';
 class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   final CollectionSource _source;
   final NextcloudMirrorStore _mirror;
+
+  // how an entry is made for an item with no local bytes; see `NextcloudPlaceholderEntries`
+  final NextcloudPlaceholderEntries _placeholders;
 
   // Entry ids by URI for every `origin = nextcloud` DB row, built once from the DB and kept in step by the sink,
   // which is the only writer of those rows (the source removes one on its own only when a refresh finds the file
@@ -39,7 +43,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   static const batchSize = 100;
   static const flushDelay = Duration(seconds: 2);
 
-  new(this._source, this._mirror) {
+  new(this._source, this._mirror, {this._placeholders = const UnimplementedNextcloudPlaceholderEntries()}) {
     _subscriptions.add(_source.eventBus.on<EntryRemovedEvent>().listen(_onEntriesRemoved));
   }
 
@@ -85,7 +89,22 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     final uri = Uri.file(localPath).toString();
     final fetched = await mediaFetchService.getEntry(uri, null, allowUnsized: true);
     if (fetched == null) return false;
+    return _putEntry(uri, fetched);
+  }
 
+  @override
+  Future<bool> putPlaceholder(NextcloudAccount account, NextcloudRemoteItem item) async {
+    // the URI a mirrored file for this path *would* have, so that a later fetch of real bytes refreshes
+    // this entry in place instead of creating a second one for the same photo
+    final uri = _uriFor(account, item.relativePath);
+    final synthesised = _placeholders.build(account, item);
+    if (synthesised == null) return false;
+    return _putEntry(uri, synthesised);
+  }
+
+  // insert-or-refresh for one URI, shared by both puts: everything below is about reconciling the DB row,
+  // the loaded collection and the id index, none of which cares where the entry came from
+  Future<bool> _putEntry(String uri, AvesEntry fetched) async {
     final index = await _idByUri;
     final id = index[uri];
     if (id != null) {

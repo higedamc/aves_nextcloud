@@ -8,6 +8,7 @@ import 'package:aves/model/favourites.dart';
 import 'package:aves/model/filters/covered/stored_album.dart';
 import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/account.dart';
+import 'package:aves/model/nextcloud/placeholder_entries.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 import 'package:aves/model/nextcloud/sync_sink_impl.dart';
 import 'package:aves/model/source/collection_source.dart';
@@ -249,4 +250,50 @@ void main() {
     expect(covers.of(filterA)?.entryId, isNull);
     expect(covers.of(filterB)?.entryId, isNull);
   });
+
+  group('putPlaceholder', () {
+    test('delegates to the placeholder builder and inserts at the mirror URI', () async {
+      source = await initSource();
+      final built = fetched(localA);
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(built));
+
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
+
+      // the URI is the one a mirrored file for this path *would* have, so a later fetch of real bytes
+      // refreshes this entry rather than making a second one for the same photo
+      expect(db.inserts.length, 1);
+      expect(db.inserts.single.single.uri, Uri.file(localA).toString());
+      expect(db.inserts.single.single.origin, EntryOrigins.nextcloud);
+      expect(inCollection(Uri.file(localA).toString()).length, 1);
+      // never consulted: there are no bytes to read
+      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+    });
+
+    test('a builder that cannot make an entry is a refusal, not a failure', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: const _StubPlaceholders(null));
+
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isFalse);
+      expect(db.inserts, isEmpty);
+      expect(inCollection(Uri.file(localA).toString()), isEmpty);
+    });
+
+    test('the default builder is unimplemented and says so loudly', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+
+      // nothing creates placeholder rows yet; a silent null here would lose every item it was meant to show
+      await expectLater(sink.putPlaceholder(account, itemFor(relA)), throwsUnimplementedError);
+    });
+  });
+}
+
+// A stand-in for the leaf that will synthesise entries without local bytes.
+class _StubPlaceholders implements NextcloudPlaceholderEntries {
+  final AvesEntry? entry;
+
+  const new(this.entry);
+
+  @override
+  AvesEntry? build(NextcloudAccount account, NextcloudRemoteItem item) => entry;
 }

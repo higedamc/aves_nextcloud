@@ -121,6 +121,30 @@ void main() {
       expect(await index.sumLocalSizeBytes(account), 120, reason: 'pinning does not stop the bytes counting against the budget');
     });
 
+    test('the rebuild keeps the access index and leaves no stale column behind', () async {
+      await writeV1([v1Row('trip/a.jpg', 120)]);
+
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      final db = await databaseFactory.openDatabase(dbPath, options: OpenDatabaseOptions(singleInstance: true));
+
+      // the old index is dropped with the old table, and a lost index is silent: nothing fails, eviction
+      // just degrades to a full scan, which only shows up at six figures of rows
+      final indexes = await db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", [SqfliteNextcloudMirrorIndex.table]);
+      expect(indexes.map((v) => v['name']), contains('${SqfliteNextcloudMirrorIndex.table}_lastAccessAt'));
+
+      // v1's `sizeBytes` is gone rather than left behind unmaintained; leaving it was the first attempt and
+      // it broke every insert, since it is NOT NULL with no default
+      final columns = await db.rawQuery('PRAGMA table_info(${SqfliteNextcloudMirrorIndex.table})');
+      final names = columns.map((v) => v['name']).toSet();
+      expect(names, isNot(contains('sizeBytes')));
+      expect(names, containsAll(<String>['tier', 'remoteSizeBytes', 'localSizeBytes', 'pinned']));
+
+      // and the staging table did not survive the rename
+      final tables = await db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'table'");
+      expect(tables.map((v) => v['name']), isNot(contains('${SqfliteNextcloudMirrorIndex.table}_v2')));
+    });
+
     test('a fresh v2 database round trips every new field', () async {
       final index = SqfliteNextcloudMirrorIndex();
       await index.init();

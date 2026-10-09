@@ -23,6 +23,14 @@ abstract class NextcloudSyncSink {
   // rotation burned in, so a portrait photo would otherwise be recorded as landscape.
   Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier);
 
+  // Creates or refreshes the entry for an item the mirror holds **no bytes** for, so it appears in the
+  // gallery and can be fetched on demand. Returns false when no entry could be made.
+  //
+  // Deliberately not `putMirroredFile` with a tier of `placeholder`: that signature takes a `localPath`,
+  // and there is no path to give for bytes that do not exist. A caller would have to invent one, and the
+  // sink would stat it, fail, and report a parse failure for an item that is in fact fine.
+  Future<bool> putPlaceholder(NextcloudAccount account, NextcloudRemoteItem item);
+
   // Removes the entries of mirrored files that are gone (removed on the server, evicted, or missing).
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths);
 }
@@ -36,8 +44,13 @@ abstract class NextcloudSyncSink {
 //
 // - an image is satisfied by a row at `NextcloudMirrorTier.grid` or later, with its bytes on disk,
 // - a video is satisfied by its poster row, equally at `grid` or later,
-// - a video above `NextcloudAccount.videoAutoDownloadLimitBytes`, or one whose poster the server and the
-//   device both failed to produce, is satisfied by a `placeholder` row, which has no bytes by design,
+// - **any** item whose derivative neither the server nor the device could produce is satisfied by a
+//   `placeholder` row, which has no bytes by design. Not only a video above
+//   `NextcloudAccount.videoAutoDownloadLimitBytes`: Nextcloud's default `enabledPreviewProviders` excludes
+//   HEIC and HEIF, so an image that answers 404 is a real server shape, and if it had no satisfying
+//   outcome it would withhold the root etag forever and re-list the whole tree on every sync — the exact
+//   hole this rule exists to close. Whether a leaf prefers to fall back to the original for a small image
+//   is its own call; the rule only has to admit the outcome.
 // - the `view` and `original` tiers never enter the rule. They are fetched on demand, so requiring them
 //   would mean no root etag is ever published again.
 //

@@ -99,6 +99,10 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         final rows = {for (final row in await _mirror.listAll(account)) row.relativePath: row};
         final missing = <String>{};
         for (final path in rows.keys) {
+          // A `placeholder` row has no file by design, so this reads it as a cache miss and the plan below
+          // drops it as `lost`. Teaching both this sweep and `_mirrorReflects` to exempt that tier is the
+          // first thing the leaf that introduces placeholders has to do; until something creates one, no
+          // row can reach here with that tier.
           if (!await File(_mirror.localPathFor(account, path)).exists()) missing.add(path);
         }
 
@@ -230,11 +234,12 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           break;
         }
         // make room first; whatever goes must leave the collection in the same step
-        final evicted = await _mirror.evictToFit(account, reserveBytes: item.sizeBytes);
-        if (evicted.isNotEmpty) {
-          await _sink.removeMirroredFiles(account, evicted);
-          stats.evicted += evicted.length;
-          if (evicted.any(fetchedThisRun.contains)) {
+        final eviction = await _mirror.evictToFit(account, reserveBytes: item.sizeBytes);
+        if (!eviction.isEmpty) {
+          await _applyEviction(account, eviction, stats);
+          // `touched`, not `removed`: a file this run fetched is just as lost to it if the store demoted
+          // it to a cheaper tier as if the store deleted it
+          if (eviction.touched.any(fetchedThisRun.contains)) {
             // a refreshed file keeps its old LRU position, so the store may still pick one of this run's
             // files: stop here rather than trade the newest files for older ones
             stats.skipped += downloads.length - i;
@@ -322,10 +327,22 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   }
 
   Future<void> _evict(NextcloudAccount account, _Stats stats) async {
-    final evicted = await _mirror.evictToFit(account);
-    if (evicted.isEmpty) return;
-    await _sink.removeMirroredFiles(account, evicted);
-    stats.evicted += evicted.length;
+    final eviction = await _mirror.evictToFit(account);
+    if (eviction.isEmpty) return;
+    await _applyEviction(account, eviction, stats);
+  }
+
+  // Both eviction sites go through here so the two outcomes cannot be handled differently by accident.
+  //
+  // `demoted` is structurally empty until the view tier exists, which is why there is an `assert` and not
+  // a branch: the refresh a demoted entry needs (its bytes and its recorded dimensions both changed) is
+  // the leaf that introduces demotion to write, and an empty handler here would let that leaf ship a grid
+  // full of entries describing bytes that are no longer there.
+  Future<void> _applyEviction(NextcloudAccount account, NextcloudEvictionOutcome eviction, _Stats stats) async {
+    assert(eviction.demoted.isEmpty, 'demoted rows need their entries refreshed, which is not implemented');
+    if (eviction.removed.isEmpty) return;
+    await _sink.removeMirroredFiles(account, eviction.removed);
+    stats.evicted += eviction.removed.length;
   }
 
   // a process that died mid-download leaves `<path>.part` behind: not indexed, not evictable, never reused

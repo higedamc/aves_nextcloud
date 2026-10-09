@@ -330,7 +330,12 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height}) async {
     final fileId = item.fileId;
     if (fileId == null) {
-      throw NextcloudNotFoundFailure(item.relativePath);
+      // No `oc:fileid` (absent, in a 404 propstat, or unparsable) means this server cannot give us a preview
+      // for this item: the endpoint is addressed by id and there is nothing else to address it by. It is the
+      // same answer as the 404 below, not a missing item, and callers treat it the same way: placeholder
+      // row, etag published. Throwing `NotFound` here instead left the item a permanent failure that
+      // withheld the collection etag and re-listed the whole tree every run.
+      throw NextcloudPreviewUnavailableFailure(item.relativePath);
     }
     try {
       final response = await _send(

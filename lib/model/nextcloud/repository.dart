@@ -92,7 +92,8 @@ abstract class NextcloudRepository {
   //   `NextcloudRemoteItem.photoMetadata`, which makes that field load-bearing rather than a hint.
   // - a 404 means "no preview for this item", not "no such item", and must be thrown as
   //   `NextcloudPreviewUnavailableFailure`. Every video on a server without ffmpeg answers 404 here while
-  //   `nc:has-preview` still reports true.
+  //   `nc:has-preview` still reports true. An item with no `fileId` is the same failure: the endpoint is
+  //   addressed by id, so there is no preview to ask for, and the item is not gone.
   Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height});
 
   // Poster frame of a video, sized like `fetchPreview`, for a grid tile.

@@ -71,6 +71,17 @@ class NextcloudServerFailure extends NextcloudFailure {
   const new(this.statusCode, [String? detail]) : super('server error (HTTP $statusCode)${detail != null ? ': $detail' : ''}');
 }
 
+// The server has no derivative for this item and cannot make one: `/core/preview` answered 404, or no
+// frame could be extracted from a video. A normal outcome, not an item failure — every video on a server
+// without ffmpeg answers this way while still advertising `nc:has-preview: true` — so the sync's answer is
+// a `placeholder` row rather than a reported failure. Distinct from `NextcloudNotFoundFailure`, which says
+// the item itself is gone and does mean the mirror row should go with it.
+class NextcloudPreviewUnavailableFailure extends NextcloudFailure {
+  final String relativePath;
+
+  const new(this.relativePath) : super('no preview available');
+}
+
 // the operation was cancelled through its `NextcloudCancellation`
 class NextcloudCancelledFailure extends NextcloudFailure {
   const new() : super('cancelled');

@@ -84,15 +84,19 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
       // recording a row for a file that is not there would make `usedBytes` lie forever
       throw NextcloudNotFoundFailure(normalized);
     }
-    // the size is read back from disk rather than trusted from the caller, so that accounting and
-    // eviction are driven by the same source as the bytes they are supposed to account for
+    // the local size is read back from disk rather than trusted from the caller, so that accounting and
+    // eviction are driven by the same source as the bytes they are supposed to account for. The remote
+    // size, the tier and the pin cannot be derived from the bytes, so those come from the caller verbatim.
     await _index.put(
       account,
       NextcloudMirrorIndexEntry(
         relativePath: normalized,
         etag: entry.etag,
         fileId: entry.fileId,
-        sizeBytes: stat.size,
+        tier: entry.tier,
+        remoteSizeBytes: entry.remoteSizeBytes,
+        localSizeBytes: stat.size,
+        pinned: entry.pinned,
         remoteLastModified: entry.remoteLastModified,
         downloadedAt: entry.downloadedAt,
         lastAccessAt: entry.lastAccessAt,
@@ -117,7 +121,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   }
 
   @override
-  Future<int> usedBytes(NextcloudAccount account) => _index.sumSizeBytes(account);
+  Future<int> usedBytes(NextcloudAccount account) => _index.sumLocalSizeBytes(account);
 
   // one page of eviction candidates; removing them brings up the next page in the same order.
   // A page that is entirely undeletable stops eviction, so this is also the number of consecutive
@@ -129,7 +133,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     final budget = account.cacheLimitBytes - reserveBytes;
     final target = budget < 0 ? 0 : budget;
 
-    var used = await _index.sumSizeBytes(account);
+    var used = await _index.sumLocalSizeBytes(account);
     final evicted = <String>{};
 
     while (used > target) {
@@ -155,7 +159,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
           continue;
         }
         evicted.add(victim.relativePath);
-        used -= victim.sizeBytes;
+        used -= victim.localSizeBytes;
         removedFromPage++;
       }
       // nothing on this page could go, so the next page would be the same one

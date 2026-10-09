@@ -173,6 +173,7 @@ dev_dependencies:
   flutter_lints:
   shared_preferences_platform_interface:
   test:
+  sqflite_common_ffi: ^2.4.3
 
 flutter:
   assets:

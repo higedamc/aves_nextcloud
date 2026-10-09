@@ -266,14 +266,18 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
             // the etag the bytes actually have, which may be newer than the listing's
             etag: observedEtag ?? item.etag,
             fileId: item.fileId,
-            sizeBytes: item.sizeBytes,
+            // this run mirrors whole files, so the tier is `original` and the two sizes agree; the store
+            // reads the local size back from disk either way
+            tier: NextcloudMirrorTier.original,
+            remoteSizeBytes: item.sizeBytes,
+            localSizeBytes: item.sizeBytes,
             remoteLastModified: item.lastModified,
             downloadedAt: now,
             // a server-side change is not a view: keep the LRU position of a refreshed file
             lastAccessAt: existing?.lastAccessAt ?? now,
           ),
         );
-        if (!await _sink.putMirroredFile(account, item, localPath)) {
+        if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.original)) {
           // mirrored but invisible would be skipped by etag forever: drop the bytes so the next run retries
           await _mirror.remove(account, path);
           throw NextcloudParseFailure('could not create an entry for $path');

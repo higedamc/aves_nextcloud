@@ -105,10 +105,23 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
     // served by the `lastAccessAt` index, so a page costs the page, not the account.
     // `relativePath` breaks ties: a bulk download gives a whole album the same `lastAccessAt`, and
     // without a total order successive pages could repeat or skip rows.
-    // `pinned = 0`: a pinned row is never an eviction victim, so returning it would make a page of
-    // candidates that cannot go, and the store would read "nothing on this page could go" as the end of
-    // the account while evictable rows sat behind it.
-    final rows = await _db.query(table, where: 'accountId = ? AND pinned = 0', whereArgs: [account.id], orderBy: 'lastAccessAt ASC, relativePath ASC', limit: limit);
+    // Two exclusions, both because the row cannot usefully be evicted and offering it would make a page of
+    // candidates that cannot go, which the store reads as "the account has nothing left to evict" while
+    // evictable rows sit behind it.
+    //
+    // `pinned = 0`: the user asked for those bytes.
+    // `tier != placeholder`: there are no bytes to reclaim, so removing one frees nothing and only costs
+    // the gallery entry. Worse, a placeholder is never viewed, so its `lastAccessAt` never moves and it
+    // would sit at the head of this very order — the first eviction would take every above-threshold video
+    // and every image without a preview, the next sync would re-list and recreate them, and the cycle
+    // would repeat on every eviction.
+    final rows = await _db.query(
+      table,
+      where: 'accountId = ? AND pinned = 0 AND tier != ?',
+      whereArgs: [account.id, NextcloudMirrorTier.placeholder.name],
+      orderBy: 'lastAccessAt ASC, relativePath ASC',
+      limit: limit,
+    );
     return rows.map(_toEntry).toList();
   }
 

@@ -338,6 +338,10 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   // a branch: the refresh a demoted entry needs (its bytes and its recorded dimensions both changed) is
   // the leaf that introduces demotion to write, and an empty handler here would let that leaf ship a grid
   // full of entries describing bytes that are no longer there.
+  //
+  // Read the `assert` as a development tripwire and not as a guarantee: it is compiled out of a release
+  // build, so a non-empty `demoted` would be dropped silently there. The leaf that fills the set must
+  // replace this line with the refresh rather than rely on it.
   Future<void> _applyEviction(NextcloudAccount account, NextcloudEvictionOutcome eviction, _Stats stats) async {
     assert(eviction.demoted.isEmpty, 'demoted rows need their entries refreshed, which is not implemented');
     if (eviction.removed.isEmpty) return;

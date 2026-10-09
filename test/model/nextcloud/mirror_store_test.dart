@@ -439,16 +439,31 @@ void main() {
       expect(await store.lookup(account, 'missing.jpg'), isNull);
     });
 
-    test('a placeholder is still an eviction candidate but frees nothing', () async {
+    test('a placeholder is never a victim and does not stall the rows behind it', () async {
       final account = accountWith(cacheLimitBytes: 100);
-      await store.record(account, entryFor('remote-only.mp4', sizeBytes: 3000000000, tier: NextcloudMirrorTier.placeholder));
-      await recordWritten(account, 'big.jpg', 140);
+      // `aaa` so it sorts ahead of the row with bytes: a placeholder is never viewed, so its `lastAccessAt`
+      // never moves and it really does sit at the head of the eviction order in practice
+      await store.record(account, entryFor('aaa-remote-only.mp4', sizeBytes: 3000000000, tier: NextcloudMirrorTier.placeholder));
+      await recordWritten(account, 'zzz-big.jpg', 140);
 
-      // the placeholder is older in LRU order, so it is offered first; removing it cannot reduce `used`,
-      // and eviction must still reach the row that actually holds bytes rather than stalling on it
       final removed = await evict(account);
-      expect(removed, contains('big.jpg'));
+
+      // taking the placeholder would reclaim nothing and cost the gallery entry, and the next sync would
+      // re-list and recreate it, every single time the budget bites
+      expect(removed, {'zzz-big.jpg'});
+      expect(await store.lookup(account, 'aaa-remote-only.mp4'), isNotNull, reason: 'a placeholder holds no bytes, so evicting it frees nothing and only makes a hole');
       expect(await store.usedBytes(account), 0);
+    });
+
+    test('a mirror of nothing but placeholders stops eviction instead of looping', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      await store.record(account, entryFor('a.mp4', sizeBytes: 3000000000, tier: NextcloudMirrorTier.placeholder));
+      await store.record(account, entryFor('b.mp4', sizeBytes: 3000000000, tier: NextcloudMirrorTier.placeholder));
+
+      // `used` is already 0 so there is nothing to do; the point is that excluding placeholders from the
+      // candidate query cannot turn into an empty-page loop
+      expect(await evict(account), isEmpty);
+      expect((await store.listAll(account)).length, 2);
     });
   });
 

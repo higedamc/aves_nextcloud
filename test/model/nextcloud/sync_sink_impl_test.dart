@@ -252,21 +252,43 @@ void main() {
   });
 
   group('putPlaceholder', () {
-    test('delegates to the placeholder builder and inserts at the mirror URI', () async {
+    test('stores at the mirror URI even when the builder chose another one', () async {
       source = await initSource();
-      final built = fetched(localA);
-      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(built));
+      // deliberately the *wrong* location: a builder has no reason to know the mirror layout, and if the
+      // sink passed its choice through, the row would be keyed under the mirror URI and stored under this
+      // one. After a restart `_loadIndex` rebuilds the index from stored URIs, the mirror URI would miss,
+      // and the next real fetch would create a second entry for the same photo.
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(fetched(localB)));
 
       expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
 
-      // the URI is the one a mirrored file for this path *would* have, so a later fetch of real bytes
-      // refreshes this entry rather than making a second one for the same photo
       expect(db.inserts.length, 1);
-      expect(db.inserts.single.single.uri, Uri.file(localA).toString());
-      expect(db.inserts.single.single.origin, EntryOrigins.nextcloud);
+      final inserted = db.inserts.single.single;
+      expect(inserted.uri, Uri.file(localA).toString(), reason: 'the sink is the only authority on where the entry claims to live');
+      expect(inserted.path, localA);
+      expect(inserted.origin, EntryOrigins.nextcloud);
       expect(inCollection(Uri.file(localA).toString()).length, 1);
+      expect(inCollection(Uri.file(localB).toString()), isEmpty, reason: "the builder's location must not reach the row");
       // never consulted: there are no bytes to read
       expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+    });
+
+    test('a later fetch of real bytes refreshes the placeholder instead of adding a second entry', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(fetched(localB)));
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
+      final placeholderId = db.inserts.single.single.id;
+
+      // now the real bytes arrive at the mirror path
+      await File(localA).parent.create(recursive: true);
+      await File(localA).writeAsBytes(List.filled(42, 0));
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.grid), isTrue);
+
+      // this is the invariant the URI override exists for: one entry per photo, kept across tiers
+      expect(db.inserts.length, 1, reason: 'the placeholder entry is refreshed, not joined by a second one');
+      expect(inCollection(Uri.file(localA).toString()).map((v) => v.id), {placeholderId});
     });
 
     test('a builder that cannot make an entry is a refusal, not a failure', () async {

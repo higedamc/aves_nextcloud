@@ -121,6 +121,45 @@ void main() {
       expect(await index.sumLocalSizeBytes(account), 120, reason: 'pinning does not stop the bytes counting against the budget');
     });
 
+    test('a placeholder row is not an eviction candidate in the real query', () async {
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      await index.put(
+        account,
+        NextcloudMirrorIndexEntry(
+          relativePath: 'aaa-remote-only.mp4',
+          etag: 'e1',
+          fileId: 1,
+          tier: NextcloudMirrorTier.placeholder,
+          remoteSizeBytes: 3000000000,
+          localSizeBytes: 0,
+          remoteLastModified: DateTime.fromMillisecondsSinceEpoch(1000),
+          downloadedAt: DateTime.fromMillisecondsSinceEpoch(1000),
+          // oldest access, so it heads the eviction order: a placeholder is never viewed, so this is the
+          // realistic state rather than a contrived one
+          lastAccessAt: DateTime.fromMillisecondsSinceEpoch(1000),
+        ),
+      );
+      await index.put(
+        account,
+        NextcloudMirrorIndexEntry(
+          relativePath: 'zzz-held.jpg',
+          etag: 'e2',
+          fileId: 2,
+          tier: NextcloudMirrorTier.grid,
+          remoteSizeBytes: 10000000,
+          localSizeBytes: 18062,
+          remoteLastModified: DateTime.fromMillisecondsSinceEpoch(2000),
+          downloadedAt: DateTime.fromMillisecondsSinceEpoch(2000),
+          lastAccessAt: DateTime.fromMillisecondsSinceEpoch(2000),
+        ),
+      );
+
+      // the exclusion lives in the SQL, so the fake index agreeing with the contract proves nothing here
+      final candidates = await index.getLeastRecentlyAccessed(account, limit: 10);
+      expect(candidates.map((v) => v.relativePath), ['zzz-held.jpg'], reason: 'evicting a placeholder frees nothing and only costs the gallery entry');
+    });
+
     test('the rebuild keeps the access index and leaves no stale column behind', () async {
       await writeV1([v1Row('trip/a.jpg', 120)]);
 

@@ -276,8 +276,8 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
     final target = (account.cacheLimitBytes - reserveBytes).clamp(0, account.cacheLimitBytes);
     final evicted = <String>{};
     var used = await usedBytes(account);
-    // mirrors the real store: a pinned row is never a candidate
-    final candidates = rows(account).values.where((v) => !v.pinned).toList()
+    // mirrors the real store: neither a pinned row nor a placeholder is a candidate
+    final candidates = rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList()
       ..sort((a, b) {
         final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
         return byAccess != 0 ? byAccess : a.relativePath.compareTo(b.relativePath);

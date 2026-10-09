@@ -94,12 +94,19 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
 
   @override
   Future<bool> putPlaceholder(NextcloudAccount account, NextcloudRemoteItem item) async {
+    final localPath = _mirror.localPathFor(account, item.relativePath);
     // the URI a mirrored file for this path *would* have, so that a later fetch of real bytes refreshes
     // this entry in place instead of creating a second one for the same photo
-    final uri = _uriFor(account, item.relativePath);
+    final uri = Uri.file(localPath).toString();
     final synthesised = _placeholders.build(account, item);
     if (synthesised == null) return false;
-    return _putEntry(uri, synthesised);
+    // The location is overridden here rather than asked of the builder. `_putEntry` uses `uri` only as the
+    // index key and stores `entry.uri`, so a builder that chose any other location would be keyed under
+    // the mirror URI and stored under its own: after a restart `_loadIndex` rebuilds the index from the
+    // stored URIs, the mirror URI would miss, and the next real fetch would create the second entry the
+    // comment above says it prevents. Making the sink the only authority on where the entry claims to live
+    // means a builder cannot get this wrong, and Leaf C never needs to know the mirror layout.
+    return _putEntry(uri, synthesised.copyWith(uri: uri, path: localPath));
   }
 
   // insert-or-refresh for one URI, shared by both puts: everything below is about reconciling the DB row,

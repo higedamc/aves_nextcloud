@@ -179,7 +179,9 @@ abstract class NextcloudMirrorStore {
   //   remove them, because the bytes behind them changed and so did their recorded dimensions.
   //
   // A `pinned` row is never either: the user asked for those bytes, so dropping or shrinking them silently
-  // would make an explicit download a lie. That makes the reservation refusable — pinned rows can fill the
+  // would make an explicit download a lie. Neither is a `placeholder` row: it holds no bytes, so removing
+  // one reclaims nothing and costs the gallery entry, and since it is never viewed it would otherwise sit
+  // at the head of the eviction order and be taken first, every time. That makes the reservation refusable — pinned rows can fill the
   // budget — and the caller decides, exactly as it already does when an empty mirror cannot hold a file.
   Future<NextcloudEvictionOutcome> evictToFit(NextcloudAccount account, {int reserveBytes = 0});
 

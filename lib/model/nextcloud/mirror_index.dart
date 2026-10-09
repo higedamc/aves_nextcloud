@@ -18,8 +18,10 @@ abstract class NextcloudMirrorIndex {
   // Least-recently-accessed first, at most `limit` rows. Eviction pages through this instead of
   // loading the whole account: a large library can hold a six-figure number of rows.
   //
-  // Pinned rows are excluded, because they can never be evicted: handing them back would give the store a
-  // page of candidates that cannot go, which it reads as "the account has nothing left to evict".
+  // Pinned rows and `placeholder` rows are both excluded, because neither can usefully be evicted: handing
+  // them back would give the store a page of candidates that cannot go, which it reads as "the account has
+  // nothing left to evict". A placeholder in particular has no bytes to reclaim and is never viewed, so it
+  // would sit at the head of this order forever.
   Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit});
 
   // Inserts or replaces the row for `entry.relativePath`.

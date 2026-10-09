@@ -47,8 +47,11 @@ abstract class NextcloudRepository {
   //   2. PROPFIND `Depth: 1` crawl, skipping subtrees whose collection etag matches `knownCollectionEtags`.
   // Emission order is unspecified. Cancellation stops emission with `NextcloudCancelledFailure`.
   // `onCollection` is called for every collection the crawl visits or skips (with its current etag), so the
-  // caller can persist etags for the next `knownCollectionEtags`. The SEARCH strategy returns a full snapshot
-  // and never calls it; a caller that gets no collection callbacks must diff against the full snapshot.
+  // caller can persist etags for the next `knownCollectionEtags`. The SEARCH strategy enumerates the whole
+  // scope in one query and has no subtrees to skip, so it consumes and publishes only the root's etag: an
+  // unchanged root (Nextcloud propagates etag changes to every ancestor) ends the listing without a query, and
+  // a complete query publishes the root. Sub-collection etags are consumed and published by the crawl only.
+  // Either way, the root is stat'd first and a root that cannot be listed fails the whole listing.
   // `onItemFailure` receives item-level failures (an href that cannot be mapped inside the root, a sub-collection
   // that answers 403/404/5xx or with a body that is not a multistatus) and the listing continues without that
   // item; the sync records them as `NextcloudSyncResult.itemFailures`. Without it, the first such failure is

@@ -116,9 +116,22 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   }) async* {
     final root = _normalize(relativePath);
     final info = _serverInfo ?? await probe();
+    _checkCancelled(cancellation);
+
+    // the root is listed strictly: if it cannot be listed, there is no tree to sync
+    final rootItem = await stat(root);
+    if (!rootItem.isCollection) {
+      throw NextcloudNotFoundFailure(root);
+    }
+    if (knownCollectionEtags[root] == rootItem.etag) {
+      // Nextcloud propagates etag changes up to every ancestor, so an unchanged root means an unchanged tree,
+      // whichever strategy enumerated it last time
+      onCollection?.call(rootItem);
+      return;
+    }
 
     if (info.supportsSearch) {
-      List<NextcloudRemoteItem>? snapshot;
+      _SearchSnapshot? snapshot;
       try {
         snapshot = await _searchMediaTree(root, onItemFailure, cancellation);
       } on NextcloudAuthFailure {
@@ -134,21 +147,38 @@ class WebDavNextcloudRepository implements NextcloudRepository {
         snapshot = null;
       }
       if (snapshot != null) {
-        for (final item in snapshot) {
+        for (final item in snapshot.items) {
           _checkCancelled(cancellation);
           yield item;
+        }
+        // one SEARCH covers the whole scope, so there is no subtree to publish or skip: the root is the only
+        // collection the SEARCH strategy can vouch for. Its etag was read before the search started, so a
+        // change made while paging bumps it and the next run lists again. An incomplete search (a hole the
+        // server could not describe, a page the server would not serve) vouches for nothing, as in the crawl.
+        if (snapshot.complete) {
+          onCollection?.call(rootItem);
         }
         return;
       }
     }
 
-    yield* _crawlMediaTree(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
+    final crawl = _Crawl(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
+    yield* _crawlCollection(rootItem, crawl, _Subtree(), 0);
   }
 
-  Future<List<NextcloudRemoteItem>> _searchMediaTree(String root, NextcloudItemFailureCallback? onItemFailure, NextcloudCancellation? cancellation) async {
+  Future<_SearchSnapshot> _searchMediaTree(String root, NextcloudItemFailureCallback? onItemFailure, NextcloudCancellation? cancellation) async {
     final scopeHref = NextcloudPaths.join('/files/${account.username}', NextcloudPaths.join(account.rootFolder, root));
     final results = <NextcloudRemoteItem>[];
     final seen = <String>{};
+    var complete = false;
+    // every failure reported while paging leaves the scope incompletely enumerated
+    var reported = false;
+    final NextcloudItemFailureCallback? onPageFailure = onItemFailure == null
+        ? null
+        : (path, failure) {
+            reported = true;
+            onItemFailure(path, failure);
+          };
     for (var page = 0; page < _maxSearchPages; page++) {
       _checkCancelled(cancellation);
       final body = DavRequests.searchBody(scopeHref: scopeHref, limit: searchPageSize, offset: page * searchPageSize);
@@ -159,12 +189,12 @@ class WebDavNextcloudRepository implements NextcloudRepository {
         body: body,
         relativePath: root,
       );
-      final parsed = MultistatusParser.parsePage(response.body, rootHref: account.rootHref, onItemFailure: onItemFailure);
+      final parsed = MultistatusParser.parsePage(response.body, rootHref: account.rootHref, onItemFailure: onPageFailure);
       var added = 0;
       for (final item in parsed.items) {
         if (item.isCollection || !item.isMedia) continue;
         if (!_isUnder(item.relativePath, root)) {
-          _reportOrThrow(onItemFailure, item.relativePath, NextcloudPathEscapeFailure(item.relativePath));
+          _reportOrThrow(onPageFailure, item.relativePath, NextcloudPathEscapeFailure(item.relativePath));
           continue;
         }
         if (seen.add(item.relativePath)) {
@@ -175,32 +205,15 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       // a short page is the last one; the response count is used rather than the item count because a page
       // can have holes (skipped hrefs, responses without a successful propstat) and still be full.
       // `added == 0` with items on a full page means the server ignored the offset: stop rather than loop
-      // forever. A full page whose responses all had holes has no items; keep paging, `_maxSearchPages` bounds it.
-      if (parsed.responseCount < searchPageSize || (added == 0 && parsed.items.isNotEmpty)) break;
+      // forever, and treat the scope as incomplete since the pages past the first were never served.
+      // A full page whose responses all had holes has no items; keep paging, `_maxSearchPages` bounds it.
+      if (parsed.responseCount < searchPageSize) {
+        complete = true;
+        break;
+      }
+      if (added == 0 && parsed.items.isNotEmpty) break;
     }
-    return results;
-  }
-
-  Stream<NextcloudRemoteItem> _crawlMediaTree(
-    String root,
-    Map<String, String> knownCollectionEtags,
-    void Function(NextcloudRemoteItem collection)? onCollection,
-    NextcloudItemFailureCallback? onItemFailure,
-    NextcloudCancellation? cancellation,
-  ) async* {
-    _checkCancelled(cancellation);
-    // the root is listed strictly: if it cannot be listed, there is no tree to sync
-    final rootItem = await stat(root);
-    if (!rootItem.isCollection) {
-      throw NextcloudNotFoundFailure(root);
-    }
-    if (knownCollectionEtags[root] == rootItem.etag) {
-      // Nextcloud propagates etag changes up to every ancestor, so an unchanged root means an unchanged tree
-      onCollection?.call(rootItem);
-      return;
-    }
-    final crawl = _Crawl(root, knownCollectionEtags, onCollection, onItemFailure, cancellation);
-    yield* _crawlCollection(rootItem, crawl, _Subtree(), 0);
+    return _SearchSnapshot(results, complete: complete && !reported);
   }
 
   // Lists `collection` and recurses into its changed sub-collections, depth first.
@@ -466,6 +479,14 @@ class _Crawl {
 // whether every collection under one crawl level was listed (or skipped as unchanged)
 class _Subtree {
   bool complete = true;
+}
+
+// what one SEARCH over the scope returned, and whether it covered the whole scope
+class _SearchSnapshot {
+  final List<NextcloudRemoteItem> items;
+  final bool complete;
+
+  const new(this.items, {required this.complete});
 }
 
 class WebDavNextcloudRepositoryFactory implements NextcloudRepositoryFactory {

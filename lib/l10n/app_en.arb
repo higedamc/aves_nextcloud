@@ -1078,6 +1078,7 @@
       }
     }
   },
+  "nextcloudInfoMetadataUnavailable": "This file has not been downloaded yet, so there is no metadata to show.",
 
   "settingsPermissionsTile": "Permissions",
   "settingsPermissionsPageTitle": "Permissions",

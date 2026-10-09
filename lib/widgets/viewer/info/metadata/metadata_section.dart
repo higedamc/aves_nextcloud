@@ -2,9 +2,12 @@ import 'dart:async';
 
 import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/entry/extensions/info.dart';
+import 'package:aves/model/entry/extensions/props.dart';
+import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/settings/settings.dart';
 import 'package:aves/theme/durations.dart';
 import 'package:aves/theme/icons.dart';
+import 'package:aves/widgets/common/extensions/build_context.dart';
 import 'package:aves/widgets/common/identity/buttons/outlined_button.dart';
 import 'package:aves/widgets/viewer/info/common.dart';
 import 'package:aves/widgets/viewer/info/metadata/metadata_dir.dart';
@@ -84,7 +87,10 @@ class _MetadataSectionSliverState extends State<MetadataSectionSliver> {
           builder: (context, metadata, child) {
             Widget content;
             if (metadata.isEmpty) {
-              content = const SizedBox();
+              // a Nextcloud placeholder has no local bytes at all (as opposed to a preview, which has a
+              // thin metadata section but a file), so it is the one case worth explaining rather than
+              // leaving blank; see `PLANS/AVES_NEXTCLOUD_F2_LEAF_BRIEFS.md` item 5
+              content = entry.origin == EntryOrigins.nextcloud && entry.isMissingAtPath ? _buildNotMirroredMessage(context) : const SizedBox();
             } else {
               final durations = context.watch<DurationsData>();
               content = Column(
@@ -141,6 +147,17 @@ class _MetadataSectionSliverState extends State<MetadataSectionSliver> {
             );
           },
         ),
+      ),
+    );
+  }
+
+  Widget _buildNotMirroredMessage(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 24, bottom: 8),
+      child: Text(
+        context.l10n.nextcloudInfoMetadataUnavailable,
+        style: theme.textTheme.bodySmall!.copyWith(color: theme.colorScheme.onSurfaceVariant),
       ),
     );
   }

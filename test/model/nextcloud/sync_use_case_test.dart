@@ -486,6 +486,116 @@ void main() {
     });
   });
 
+  group('pinned originals', () {
+    test('fetchOriginal downloads the whole file, pins it, and no later run downgrades or unpins it', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase);
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.grid);
+
+      clock = clock.add(const Duration(hours: 1));
+      expect(await useCase.fetchOriginal(accountWith(), 'a.jpg'), isNull);
+      expect(server.downloads, ['Sub/b.mp4', 'a.jpg']);
+      expect(sink.putTiers['a.jpg'], NextcloudMirrorTier.original);
+      var row = mirror.rows(accountWith())['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.pinned, isTrue);
+      expect(row.localSizeBytes, 3);
+      expect(row.lastAccessAt, clock, reason: 'asked for by the user: a view');
+
+      // a re-listed, unchanged file is current at the held tier: the preview and the original are all
+      // that was ever fetched for it
+      server.collections[''] = 'root-v2';
+      await sync(useCase);
+      expect(server.fetched.where((v) => v == 'a.jpg').length, 2);
+
+      // a forced run re-fetches it whole and keeps the pin
+      await sync(useCase, force: true);
+      expect(server.downloads.where((v) => v == 'a.jpg').length, 2);
+      expect(server.previewPaths.where((v) => v == 'a.jpg').length, 1, reason: 'never previewed again');
+      row = mirror.rows(accountWith())['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.pinned, isTrue, reason: 'a refresh does not unpin');
+    });
+
+    test('a pinned original survives a budget squeeze that evicts everything else', () async {
+      final server = serverWith(files: [fakeFile('old.jpg', modified: day1, fileId: 1)]);
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 6);
+      await sync(useCase, account: account);
+      expect(await useCase.fetchOriginal(account, 'old.jpg'), isNull);
+
+      server.collections[''] = 'root-v2';
+      server.files['new2.jpg'] = fakeFile('new2.jpg', modified: day2, fileId: 2);
+      await sync(useCase, account: account);
+      expect(mirror.rows(account).keys, {'old.jpg', 'new2.jpg'});
+
+      clock = clock.add(const Duration(days: 1));
+      server.collections[''] = 'root-v3';
+      server.files['new1.jpg'] = fakeFile('new1.jpg', modified: day3, fileId: 3);
+      final squeezed = await sync(useCase, account: account);
+      expect(squeezed.evicted, 1);
+      expect(sink.removed, {'new2.jpg'}, reason: 'the unpinned row goes, however old the pinned one is');
+      expect(mirror.rows(account).keys, {'old.jpg', 'new1.jpg'});
+      expect(mirror.rows(account)['old.jpg']?.pinned, isTrue);
+    });
+
+    test('a budget full of pinned rows refuses the sync with a quota failure rather than an eviction', () async {
+      final server = serverWith(files: [fakeFile('old.jpg', modified: day1, fileId: 1)]);
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 3);
+      await sync(useCase, account: account);
+      // the pin evicts the item's own unpinned grid row to make room for its original
+      expect(await useCase.fetchOriginal(account, 'old.jpg'), isNull);
+      expect(await mirror.usedBytes(account), 3);
+
+      server.collections[''] = 'root-v2';
+      server.files['new2.jpg'] = fakeFile('new2.jpg', modified: day2, fileId: 2);
+      final result = await sync(useCase, account: account);
+      expect(result.itemFailures['new2.jpg'], isA<NextcloudQuotaFailure>());
+      expect(result.evicted, 0);
+      expect(mirror.rows(account)['old.jpg']?.pinned, isTrue);
+    });
+
+    test('releaseOriginal unpins, and the row is then evictable like any other', () async {
+      final server = serverWith(files: [fakeFile('old.jpg', modified: day1, fileId: 1)]);
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 3);
+      await sync(useCase, account: account);
+      expect(await useCase.fetchOriginal(account, 'old.jpg'), isNull);
+
+      expect(await useCase.releaseOriginal(account, 'old.jpg'), isNull);
+      expect(mirror.rows(account)['old.jpg']?.pinned, isFalse);
+      expect(mirror.rows(account)['old.jpg']?.tier, NextcloudMirrorTier.original, reason: 'the bytes stay until the budget wants them');
+
+      server.collections[''] = 'root-v2';
+      server.files['new2.jpg'] = fakeFile('new2.jpg', modified: day2, fileId: 2);
+      final result = await sync(useCase, account: account);
+      expect(result.evicted, 1);
+      expect(sink.removed, {'old.jpg'});
+      expect(await useCase.releaseOriginal(account, 'old.jpg'), isA<NextcloudNotFoundFailure>());
+    });
+
+    test('fetchOriginal reports its failure instead of throwing, and only pins what is already whole', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      expect(await useCase.fetchOriginal(accountWith(), 'nope.jpg'), isA<NextcloudNotFoundFailure>());
+      expect(await useCase.fetchOriginal(accountWith(), 'Sub'), isA<NextcloudNotFoundFailure>(), reason: 'a folder is not an item');
+
+      // a row written before tiers existed: whole, unpinned
+      final path = mirror.localPathFor(accountWith(), 'a.jpg');
+      await File(path).parent.create(recursive: true);
+      await File(path).writeAsBytes([1, 2, 3]);
+      await mirror.record(
+        accountWith(),
+        NextcloudMirrorIndexEntry(relativePath: 'a.jpg', etag: 'v1', fileId: 1, tier: NextcloudMirrorTier.original, remoteSizeBytes: 3, localSizeBytes: 3, remoteLastModified: day1, downloadedAt: day1, lastAccessAt: day1),
+      );
+      expect(await useCase.fetchOriginal(accountWith(), 'a.jpg'), isNull);
+      expect(server.downloads, isEmpty, reason: 'already whole: only the pin was missing');
+      expect(mirror.rows(accountWith())['a.jpg']?.pinned, isTrue);
+    });
+  });
+
   group('video threshold and placeholders', () {
     // `Sub/b.mp4` is 3 bytes; a threshold of 2 puts it above, the default puts it below
     const above = 2;

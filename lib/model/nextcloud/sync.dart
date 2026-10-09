@@ -73,4 +73,14 @@ abstract class NextcloudSyncUseCase {
   Stream<NextcloudSyncProgress> run(NextcloudSyncRequest request);
 
   Future<NextcloudSyncResult> get lastResult;
+
+  // Fetches the whole file for one listed item and pins it: never evicted and never downgraded until
+  // `releaseOriginal`. This is the explicit action behind "download original" (a wallpaper, a share, the
+  // full metadata); the sync never pins anything. Runs under the same per-account serialization as `run`,
+  // so no eviction races it. Completes with the failure for that item rather than throwing it; `null` is
+  // success. A pinned row can fill the budget: the sync then reports quota failures for what it cannot fit.
+  Future<NextcloudFailure?> fetchOriginal(NextcloudAccount account, String relativePath, {NextcloudCancellation? cancellation});
+
+  // Unpins a held original. The bytes stay, evictable like any other row, until the budget wants them.
+  Future<NextcloudFailure?> releaseOriginal(NextcloudAccount account, String relativePath);
 }

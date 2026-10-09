@@ -79,8 +79,14 @@ void main() {
       expect(result.isSuccess, isTrue);
       expect(result.added, 3);
       expect(server.listedRoots, ['']);
-      expect(server.downloads, ['Sub/Deep/c.jpg', 'Sub/b.mp4', 'a.jpg']);
+      expect(server.fetched, ['Sub/Deep/c.jpg', 'Sub/b.mp4', 'a.jpg']);
+      // images as their grid derivative, a video below the threshold whole
+      expect(server.previews, ['Sub/Deep/c.jpg@256x256', 'a.jpg@256x256']);
+      expect(server.downloads, ['Sub/b.mp4']);
       expect(sink.puts, ['Sub/Deep/c.jpg', 'Sub/b.mp4', 'a.jpg']);
+      expect(sink.putTiers, {'Sub/Deep/c.jpg': NextcloudMirrorTier.grid, 'Sub/b.mp4': NextcloudMirrorTier.original, 'a.jpg': NextcloudMirrorTier.grid});
+      expect(mirror.rows(accountWith())['a.jpg']?.localSizeBytes, 2, reason: 'the preview bytes, not the remote size');
+      expect(mirror.rows(accountWith())['a.jpg']?.remoteSizeBytes, 3);
       expect(mirror.rows(accountWith()).keys, containsAll(['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']));
       expect(await File(mirror.localPathFor(accountWith(), 'Sub/Deep/c.jpg')).exists(), isTrue);
       expect(states.states['acc1']?.collectionEtags, {'': 'root-v1', 'Sub': 'sub-v1', 'Sub/Deep': 'deep-v1'});
@@ -114,7 +120,7 @@ void main() {
       final result = await sync(useCase);
       expect(result.added + result.updated + result.removed + result.evicted, 0);
       expect(server.knownEtagsReceived.last, {'': 'root-v1', 'Sub': 'sub-v1', 'Sub/Deep': 'deep-v1'});
-      expect(server.downloads.length, 3, reason: 'nothing downloaded again');
+      expect(server.fetched.length, 3, reason: 'nothing fetched again');
       expect(sink.puts, isEmpty);
       expect(sink.removed, isEmpty);
       expect(states.states['acc1']?.collectionEtags, {'': 'root-v1', 'Sub': 'sub-v1', 'Sub/Deep': 'deep-v1'});
@@ -227,7 +233,8 @@ void main() {
     });
 
     test('a network failure during download is fatal and persists no etags', () async {
-      final server = serverWith()..downloadFailures['Sub/Deep/c.jpg'] = const NextcloudNetworkFailure('reset');
+      // an image is fetched as a preview, so the failure sits on that endpoint
+      final server = serverWith()..previewFailures['Sub/Deep/c.jpg'] = const NextcloudNetworkFailure('reset');
       final progress = <NextcloudSyncProgress>[];
       final result = await sync(useCaseWith(server), progress: progress);
       expect(result.fatal, isA<NextcloudNetworkFailure>());
@@ -245,7 +252,7 @@ void main() {
       await File(mirror.localPathFor(accountWith(), 'a.jpg')).delete();
 
       final result = await sync(useCase, force: true);
-      expect(server.downloads.where((v) => v == 'a.jpg').length, 2);
+      expect(server.fetched.where((v) => v == 'a.jpg').length, 2);
       expect(await File(mirror.localPathFor(accountWith(), 'a.jpg')).exists(), isTrue);
       expect(result.isSuccess, isTrue);
     });
@@ -287,7 +294,7 @@ void main() {
     test('downloads newest first until the budget is full, then counts the rest as skipped without thrashing', () async {
       final server = serverWith();
       final result = await sync(useCaseWith(server), account: accountWith(cacheLimitBytes: 6));
-      expect(server.downloads, ['Sub/Deep/c.jpg', 'Sub/b.mp4']);
+      expect(server.fetched, ['Sub/Deep/c.jpg', 'Sub/b.mp4']);
       expect(result.added, 2);
       expect(result.skipped, 1);
       expect(result.evicted, 0);
@@ -323,7 +330,7 @@ void main() {
       server.files['new2.jpg'] = fakeFile('new2.jpg', modified: day3, fileId: 3);
       final result = await sync(useCase, account: accountWith(cacheLimitBytes: 6));
 
-      expect(server.downloads.sublist(1), ['new2.jpg', 'new1.jpg']);
+      expect(server.fetched.sublist(1), ['new2.jpg', 'new1.jpg']);
       expect(result.evicted, 1);
       expect(sink.removed, {'old.jpg'});
       expect(mirror.rows(accountWith()).keys, {'new1.jpg', 'new2.jpg'});
@@ -386,7 +393,7 @@ void main() {
       await Future.wait([first, second]);
       expect(server.probeCount, 2);
       // the second run saw the first run's state: unchanged root, nothing downloaded again
-      expect(server.downloads.length, 3);
+      expect(server.fetched.length, 3);
       expect(server.knownEtagsReceived.last, isNotEmpty);
     });
 
@@ -405,6 +412,80 @@ void main() {
     });
   });
 
+  group('grid tier', () {
+    test('an image the server cannot render gets a placeholder row, not a failure, and the subtree is still promised', () async {
+      // HEIC and HEIF under Nextcloud's default preview providers answer 404 while remaining listed
+      final server = serverWith()..previewFailures['a.jpg'] = const NextcloudPreviewUnavailableFailure('a.jpg');
+      final result = await sync(useCaseWith(server));
+
+      expect(result.added, 3);
+      expect(result.itemFailures, isEmpty);
+      expect(sink.placeholders, ['a.jpg']);
+      expect(server.downloads, ['Sub/b.mp4'], reason: 'no fallback to the original here; that is a later call');
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.placeholder);
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v1'));
+
+      // and it is current until the file changes: not re-asked every run
+      server.collections[''] = 'root-v2';
+      final again = await sync(useCaseWith(server));
+      expect(again.skipped, 1);
+      expect(sink.placeholders.length, 1);
+    });
+
+    test('the budget reserves a ceiling for a derivative and accounts the bytes that landed', () async {
+      // a 10 MB original whose preview is 2 bytes must fit a 128 KB budget (the grid ceiling is 64 KB):
+      // the remote size has no bearing on a derivative
+      final server = serverWith(
+        files: [fakeFile('big.jpg', size: 10 * 1024 * 1024, modified: day1, fileId: 1)],
+      );
+      final result = await sync(useCaseWith(server), account: accountWith(cacheLimitBytes: 128 * 1024));
+
+      expect(result.itemFailures, isEmpty);
+      expect(server.previewPaths, ['big.jpg']);
+      final row = mirror.rows(accountWith())['big.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.grid);
+      expect(row.localSizeBytes, 2);
+      expect(row.remoteSizeBytes, 10 * 1024 * 1024);
+      expect(await mirror.usedBytes(accountWith()), 2);
+      expect(states.states['acc1']?.collectionEtags, isNotEmpty);
+    });
+
+    test('a derivative is written through a part file and carries the server date', () async {
+      final server = serverWith();
+      await sync(useCaseWith(server));
+      final path = mirror.localPathFor(accountWith(), 'a.jpg');
+      expect(await File(path).exists(), isTrue);
+      expect(await File('$path.part').exists(), isFalse);
+      // a preview carries no Exif, so the file date is the only date the entry has until the catalogue learns it
+      expect((await File(path).lastModified()).toUtc().millisecondsSinceEpoch ~/ 1000, day1.millisecondsSinceEpoch ~/ 1000);
+    });
+
+    test('an image already held as an original is not downgraded, not even by a forced run', () async {
+      // a row written before tiers existed: the file is whole and the row says so
+      final server = serverWith();
+      final path = mirror.localPathFor(accountWith(), 'a.jpg');
+      await File(path).parent.create(recursive: true);
+      await File(path).writeAsBytes([1, 2, 3]);
+      await mirror.record(
+        accountWith(),
+        NextcloudMirrorIndexEntry(relativePath: 'a.jpg', etag: 'v1', fileId: 1, tier: NextcloudMirrorTier.original, remoteSizeBytes: 3, localSizeBytes: 3, remoteLastModified: day1, downloadedAt: day1, lastAccessAt: day1),
+      );
+      final useCase = useCaseWith(server);
+
+      await sync(useCase);
+      expect(server.fetched, isNot(contains('a.jpg')), reason: 'an original satisfies the grid tier');
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.original);
+
+      // forcing re-fetches what is held, not what is wanted
+      await sync(useCase, force: true);
+      expect(server.downloads, containsAll(['a.jpg']));
+      expect(server.previewPaths, isNot(contains('a.jpg')));
+      final row = mirror.rows(accountWith())['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.localSizeBytes, 3);
+    });
+  });
+
   group('video threshold and placeholders', () {
     // `Sub/b.mp4` is 3 bytes; a threshold of 2 puts it above, the default puts it below
     const above = 2;
@@ -414,7 +495,7 @@ void main() {
       final account = accountWith(videoAutoDownloadLimitBytes: above);
       final result = await sync(useCaseWith(server), account: account);
 
-      expect(server.downloads, ['Sub/Deep/c.jpg', 'a.jpg'], reason: 'the video is not fetched');
+      expect(server.fetched, ['Sub/Deep/c.jpg', 'a.jpg'], reason: 'the video is not fetched');
       expect(sink.placeholders, ['Sub/b.mp4']);
       final row = mirror.rows(account)['Sub/b.mp4']!;
       expect(row.tier, NextcloudMirrorTier.placeholder);
@@ -439,7 +520,7 @@ void main() {
       expect(second.lost, 0, reason: 'a row with no file is a cache miss, except a placeholder');
       expect(second.skipped, 2, reason: 'a.jpg and the placeholder video are both current');
       expect(sink.placeholders.length, 1, reason: 'not put again');
-      expect(server.downloads.length, 2);
+      expect(server.fetched.length, 2);
       expect(mirror.rows(account)['Sub/b.mp4']?.tier, NextcloudMirrorTier.placeholder);
     });
 
@@ -455,7 +536,7 @@ void main() {
       final lowered = await sync(useCase, account: accountWith(videoAutoDownloadLimitBytes: above));
       expect(sink.placeholders, isEmpty);
       expect(lowered.skipped, 2, reason: 'an original answers for a placeholder, so the video is current');
-      expect(server.downloads.length, 3, reason: 'nothing re-fetched');
+      expect(server.fetched.length, 3, reason: 'nothing re-fetched');
       final row = mirror.rows(accountWith())['Sub/b.mp4']!;
       expect(row.tier, NextcloudMirrorTier.original);
       expect(row.localSizeBytes, 3);
@@ -508,7 +589,7 @@ void main() {
       final result = await sync(useCaseWith(server), account: account);
 
       expect(sink.placeholders, ['v.mp4'], reason: 'the video behind the break is listed, so it must appear');
-      expect(server.downloads, ['c.jpg']);
+      expect(server.fetched, ['c.jpg']);
       expect(mirror.rows(account).keys, {'c.jpg', 'v.mp4'});
       expect(result.added, 2);
       expect(result.skipped, 1, reason: 'only the byte-wanted remainder is skipped by the budget');

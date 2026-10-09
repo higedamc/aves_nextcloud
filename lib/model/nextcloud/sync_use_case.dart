@@ -42,7 +42,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   final NextcloudSyncStateStore _states;
   final DateTime Function() _now;
 
-  final Map<String, Future<NextcloudSyncResult>> _running = {};
+  // the last task queued per account; a sync and a pinned fetch for the same account never overlap
+  final Map<String, Future<Object?>> _running = {};
   Future<NextcloudSyncResult> _lastResult = Future.value(const NextcloudSyncResult());
 
   new({
@@ -60,18 +61,102 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   @override
   Stream<NextcloudSyncProgress> run(NextcloudSyncRequest request) {
     final controller = StreamController<NextcloudSyncProgress>();
-    final accountId = request.account.id;
-    // a run for the same account waits for the previous one, whatever its outcome
-    final previous = _running[accountId]?.then((_) {}, onError: (_) {}) ?? Future.value();
-    final result = previous.then((_) => _run(request, controller.add));
-    _running[accountId] = result;
+    final result = _enqueue(request.account, () => _run(request, controller.add));
     _lastResult = result;
     // `NextcloudFailure`s end up in the result; anything else is a bug and must not vanish with the stream
-    result.then((_) {}, onError: controller.addError).whenComplete(() {
-      if (identical(_running[accountId], result)) _running.remove(accountId);
-      controller.close();
-    });
+    result.then((_) {}, onError: controller.addError).whenComplete(controller.close);
     return controller.stream;
+  }
+
+  @override
+  Future<NextcloudFailure?> fetchOriginal(NextcloudAccount account, String relativePath, {NextcloudCancellation? cancellation}) {
+    return _enqueue(account, () => _fetchOriginal(account, relativePath, cancellation));
+  }
+
+  @override
+  Future<NextcloudFailure?> releaseOriginal(NextcloudAccount account, String relativePath) {
+    return _enqueue(account, () async {
+      final existing = await _mirror.lookup(account, relativePath);
+      if (existing == null) return NextcloudNotFoundFailure(relativePath);
+      if (!existing.pinned) return null;
+      try {
+        await _mirror.record(account, existing.copyWith(pinned: false));
+        return null;
+      } on NextcloudFailure catch (e) {
+        return e;
+      }
+    });
+  }
+
+  // a task for the same account waits for the previous one, whatever its outcome
+  Future<T> _enqueue<T>(NextcloudAccount account, Future<T> Function() task) {
+    final accountId = account.id;
+    final previous = _running[accountId]?.then((_) {}, onError: (_) {}) ?? Future.value();
+    final result = previous.then((_) => task());
+    _running[accountId] = result;
+    result.whenComplete(() {
+      if (identical(_running[accountId], result)) _running.remove(accountId);
+    });
+    return result;
+  }
+
+  Future<NextcloudFailure?> _fetchOriginal(NextcloudAccount account, String relativePath, NextcloudCancellation? cancellation) async {
+    try {
+      _checkCancelled(cancellation);
+      final credentials = await _credentials.credentialsFor(account);
+      if (credentials == null) throw const NextcloudAuthFailure(0);
+      final repository = _repositories.open(account, credentials);
+      try {
+        final item = await repository.stat(relativePath);
+        if (item.isCollection || !item.isMedia) throw NextcloudNotFoundFailure(relativePath);
+        final path = item.relativePath;
+        final existing = await _mirror.lookup(account, path);
+        if (existing != null && existing.tier == NextcloudMirrorTier.original && existing.etag == item.etag) {
+          // already whole: only the pin is missing, and the access counts as a view
+          if (!existing.pinned) await _mirror.record(account, existing.copyWith(pinned: true, lastAccessAt: _now()));
+          return null;
+        }
+        final reserve = item.sizeBytes;
+        if (reserve > account.cacheLimitBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes);
+        }
+        final stats = _Stats();
+        final eviction = await _mirror.evictToFit(account, reserveBytes: reserve);
+        if (!eviction.isEmpty) await _applyEviction(account, eviction, stats);
+        final used = await _mirror.usedBytes(account);
+        if (used + reserve > account.cacheLimitBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes - used);
+        }
+        final localPath = _mirror.localPathFor(account, path);
+        final observedEtag = await repository.downloadTo(item, localPath, cancellation: cancellation);
+        final now = _now();
+        await _mirror.record(
+          account,
+          NextcloudMirrorIndexEntry(
+            relativePath: path,
+            etag: observedEtag ?? item.etag,
+            fileId: item.fileId,
+            tier: NextcloudMirrorTier.original,
+            remoteSizeBytes: item.sizeBytes,
+            localSizeBytes: item.sizeBytes,
+            pinned: true,
+            remoteLastModified: item.lastModified,
+            downloadedAt: now,
+            // asked for by the user: this is a view
+            lastAccessAt: now,
+          ),
+        );
+        if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.original)) {
+          await _mirror.remove(account, path);
+          throw NextcloudLocalStorageFailure('could not create an entry for $path');
+        }
+        return null;
+      } finally {
+        repository.dispose();
+      }
+    } on NextcloudFailure catch (e) {
+      return e;
+    }
   }
 
   Future<NextcloudSyncResult> _run(NextcloudSyncRequest request, void Function(NextcloudSyncProgress) emit) async {
@@ -386,6 +471,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
             remoteSizeBytes: item.sizeBytes,
             // the store reads the local size back from disk either way
             localSizeBytes: localBytes,
+            // a refresh (a changed file, a forced run) does not unpin: the user asked for these bytes
+            pinned: existing?.pinned ?? false,
             remoteLastModified: item.lastModified,
             downloadedAt: now,
             // a server-side change is not a view: keep the LRU position of a refreshed file

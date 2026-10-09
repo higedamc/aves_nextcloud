@@ -81,7 +81,15 @@ class FakeNextcloudRepository implements NextcloudRepository {
   Future<List<NextcloudRemoteItem>> listCollection(String relativePath) => throw UnimplementedError();
 
   @override
-  Future<NextcloudRemoteItem> stat(String relativePath) => throw UnimplementedError();
+  Future<NextcloudRemoteItem> stat(String relativePath) async {
+    final failure = failing[relativePath];
+    if (failure != null) throw failure;
+    final file = files[relativePath];
+    if (file != null) return file;
+    final etag = collections[relativePath];
+    if (etag != null) return fakeCollection(relativePath, etag);
+    throw NextcloudNotFoundFailure(relativePath);
+  }
 
   @override
   Stream<NextcloudRemoteItem> listMediaTree(

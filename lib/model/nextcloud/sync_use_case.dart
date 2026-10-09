@@ -233,50 +233,66 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     var fetchedBytes = 0;
     emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
 
-    for (var i = 0; i < downloads.length; i++) {
+    // Partitioned, so that the byte loop below only ever sees items that need bytes. Its two breaks (the
+    // budget is spent; an eviction touched this run's own fetch) abandon everything sorted behind them, and
+    // a placeholder costs nothing: left in the same list, every above-threshold video behind the break
+    // would end the run with no row, no entry and no failure, counted as skipped by a budget that has no
+    // bearing on it. Which videos appeared in the gallery would then depend on where the break fell.
+    final placeholders = downloads.where((item) => _wantedTier(account, item) == NextcloudMirrorTier.placeholder).toList();
+    final fetches = downloads.where((item) => _wantedTier(account, item) != NextcloudMirrorTier.placeholder).toList();
+
+    for (final item in placeholders) {
       _checkCancelled(cancellation);
-      final item = downloads[i];
       final path = item.relativePath;
       final existing = rows[path];
       try {
-        if (_wantedTier(account, item) == NextcloudMirrorTier.placeholder) {
-          // no bytes, so no budget, no eviction and no download: the row and the entry are all there is
-          await _mirror.record(
-            account,
-            NextcloudMirrorIndexEntry(
-              relativePath: path,
-              etag: item.etag,
-              fileId: item.fileId,
-              tier: NextcloudMirrorTier.placeholder,
-              remoteSizeBytes: item.sizeBytes,
-              localSizeBytes: 0,
-              remoteLastModified: item.lastModified,
-              downloadedAt: _now(),
-              lastAccessAt: existing?.lastAccessAt ?? _now(),
-            ),
-          );
-          if (!await _sink.putPlaceholder(account, item)) {
-            // a row with no entry would be skipped by etag forever: drop it so the next run retries
-            await _mirror.remove(account, path);
-            throw NextcloudParseFailure('could not create a placeholder entry for $path');
-          }
-          fetchedThisRun.add(path);
-          if (existing == null) {
-            stats.added++;
-          } else {
-            stats.updated++;
-          }
-          done++;
-          emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
-          continue;
+        // no bytes, so no budget, no eviction and no download: the row and the entry are all there is
+        await _mirror.record(
+          account,
+          NextcloudMirrorIndexEntry(
+            relativePath: path,
+            etag: item.etag,
+            fileId: item.fileId,
+            tier: NextcloudMirrorTier.placeholder,
+            remoteSizeBytes: item.sizeBytes,
+            localSizeBytes: 0,
+            remoteLastModified: item.lastModified,
+            downloadedAt: _now(),
+            lastAccessAt: existing?.lastAccessAt ?? _now(),
+          ),
+        );
+        if (!await _sink.putPlaceholder(account, item)) {
+          // a row with no entry would be skipped by etag forever: drop it so the next run retries
+          await _mirror.remove(account, path);
+          throw NextcloudLocalStorageFailure('could not create a placeholder entry for $path');
         }
+        fetchedThisRun.add(path);
+        if (existing == null) {
+          stats.added++;
+        } else {
+          stats.updated++;
+        }
+      } on NextcloudFailure catch (e) {
+        if (_isFatal(e)) rethrow;
+        stats.itemFailures[path] = e;
+      }
+      done++;
+      emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
+    }
+
+    for (var i = 0; i < fetches.length; i++) {
+      _checkCancelled(cancellation);
+      final item = fetches[i];
+      final path = item.relativePath;
+      final existing = rows[path];
+      try {
         if (item.sizeBytes > account.cacheLimitBytes) {
           // never empty the whole mirror for a file that cannot fit anyway
           throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes);
         }
         if (fetchedBytes + item.sizeBytes > account.cacheLimitBytes) {
           // the budget is full of this run's newest files; the rest are older and would only thrash
-          stats.skipped += downloads.length - i;
+          stats.skipped += fetches.length - i;
           break;
         }
         // make room first; whatever goes must leave the collection in the same step
@@ -288,7 +304,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           if (eviction.touched.any(fetchedThisRun.contains)) {
             // a refreshed file keeps its old LRU position, so the store may still pick one of this run's
             // files: stop here rather than trade the newest files for older ones
-            stats.skipped += downloads.length - i;
+            stats.skipped += fetches.length - i;
             break;
           }
         }
@@ -331,7 +347,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.original)) {
           // mirrored but invisible would be skipped by etag forever: drop the bytes so the next run retries
           await _mirror.remove(account, path);
-          throw NextcloudParseFailure('could not create an entry for $path');
+          throw NextcloudLocalStorageFailure('could not create an entry for $path');
         }
         fetchedThisRun.add(path);
         fetchedBytes += item.sizeBytes;

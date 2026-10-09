@@ -43,7 +43,8 @@ abstract class NextcloudSyncSink {
 // a tier, and the rule is:
 //
 // - an image is satisfied by a row at `NextcloudMirrorTier.grid` or later, with its bytes on disk,
-// - a video is satisfied by its poster row, equally at `grid` or later,
+// - a video the mirror does not hold as an `original` is satisfied by a `placeholder` row: there are no
+//   poster rows, its tile is rendered by the device's own video thumbnail path from the remote file,
 // - **any** item whose derivative neither the server nor the device could produce is satisfied by a
 //   `placeholder` row, which has no bytes by design. Not only a video above
 //   `NextcloudAccount.videoAutoDownloadLimitBytes`: Nextcloud's default `enabledPreviewProviders` excludes

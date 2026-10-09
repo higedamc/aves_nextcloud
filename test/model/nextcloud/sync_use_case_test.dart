@@ -487,7 +487,33 @@ void main() {
 
       expect(mirror.rows(account).containsKey('Sub/b.mp4'), isFalse, reason: 'a row with no entry would be skipped by etag forever');
       expect(result.itemFailures.keys, ['Sub/b.mp4']);
+      // a local condition, not an untrusted server document
+      expect(result.itemFailures['Sub/b.mp4'], isA<NextcloudLocalStorageFailure>());
       expect(states.states['acc1']?.collectionEtags, isEmpty);
+    });
+
+    test('a placeholder sorted behind the budget break still gets its row', () async {
+      // newest first: c.jpg (4 B) fills the 5 B budget, so the byte loop breaks at a.jpg (4 B), and the
+      // video (3 B, above the threshold) is the oldest item, sorted behind the break. A placeholder costs
+      // no bytes, so the budget has no bearing on it: it must not end the run with no row, no entry and no
+      // failure, counted as skipped.
+      final server = serverWith(
+        files: [
+          fakeFile('c.jpg', size: 4, modified: day3, fileId: 1),
+          fakeFile('a.jpg', size: 4, modified: day2, fileId: 2),
+          fakeFile('v.mp4', size: 3, modified: day1, fileId: 3),
+        ],
+      );
+      final account = accountWith(cacheLimitBytes: 5, videoAutoDownloadLimitBytes: above);
+      final result = await sync(useCaseWith(server), account: account);
+
+      expect(sink.placeholders, ['v.mp4'], reason: 'the video behind the break is listed, so it must appear');
+      expect(server.downloads, ['c.jpg']);
+      expect(mirror.rows(account).keys, {'c.jpg', 'v.mp4'});
+      expect(result.added, 2);
+      expect(result.skipped, 1, reason: 'only the byte-wanted remainder is skipped by the budget');
+      expect(result.itemFailures, isEmpty);
+      expect(states.states['acc1']?.collectionEtags, isEmpty, reason: 'a.jpg was not mirrored');
     });
 
     test('a promotion the budget cannot fund keeps the placeholder and withholds the subtree', () async {

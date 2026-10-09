@@ -444,6 +444,41 @@ void main() {
       // nothing creates placeholder rows yet; a silent null here would lose every item it was meant to show
       await expectLater(sink.putPlaceholder(account, itemFor(relA)), throwsUnimplementedError);
     });
+
+    test('a placeholder is catalogued from the server metadata, since there are no bytes for the device to read', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(fetched(localB)));
+      final serverMetadata = NextcloudPhotoMetadata(
+        width: 4032,
+        height: 3024,
+        originalDateTime: DateTime.utc(2023, 5, 6, 12),
+        latitude: 35.6895,
+        longitude: 139.6917,
+      );
+
+      expect(await sink.putPlaceholder(account, itemFor(relA, photoMetadata: serverMetadata)), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.isCatalogued, isTrue, reason: 'an entry with no file has nothing for the device cataloguer to do');
+      expect(inserted.catalogMetadata!.dateMillis, serverMetadata.originalDateTime!.millisecondsSinceEpoch);
+      expect(inserted.catalogMetadata!.latitude, serverMetadata.latitude);
+      expect(inserted.catalogMetadata!.longitude, serverMetadata.longitude);
+      // `insertEntries` only writes the entry row; without an explicit save `analyze()` would skip this
+      // entry (already catalogued) and the catalog data would never reach the DB
+      expect(db.catalogSaves, [inserted.catalogMetadata]);
+    });
+
+    test('a placeholder with no server date or GPS is still catalogued, visibly unknown rather than a zero', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(fetched(localB)));
+
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.isCatalogued, isTrue);
+      expect(inserted.catalogMetadata!.dateMillis, isNull);
+      expect(inserted.hasGps, isFalse);
+    });
   });
 }
 

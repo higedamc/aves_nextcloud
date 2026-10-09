@@ -44,7 +44,6 @@ void main() {
   late FakeNextcloudMirrorStore mirror;
   late _MemoryAccountStore accounts;
   late _FailingCredentialStore credentials;
-  late FakeNextcloudSyncSink sink;
   late MemoryNextcloudSyncStateStore states;
   late List<String> purgedEntriesFor;
   late NextcloudAccountUseCase useCase;
@@ -62,14 +61,12 @@ void main() {
     mirror = FakeNextcloudMirrorStore(tempDir.path);
     accounts = _MemoryAccountStore();
     credentials = _FailingCredentialStore();
-    sink = FakeNextcloudSyncSink();
     states = MemoryNextcloudSyncStateStore();
     purgedEntriesFor = [];
     useCase = NextcloudAccountUseCase(
       accounts: accounts,
       credentials: credentials,
       mirror: mirror,
-      sink: sink,
       states: states,
       removeAllEntries: (account) async => purgedEntriesFor.add(account.id),
     );
@@ -119,7 +116,6 @@ void main() {
       final edited = account.copyWith(enabled: false);
       expect(await useCase.save(edited, previous: account), isTrue);
       expect(mirror.rows(account).keys, {'a.jpg'});
-      expect(sink.removed, isEmpty);
       expect(purgedEntriesFor, isEmpty);
       expect(states.states.containsKey(account.id), isTrue);
     });
@@ -134,7 +130,6 @@ void main() {
         expect(await useCase.save(change, previous: account), isTrue);
         expect(mirror.rows(account), isEmpty);
         expect(await File(mirror.localPathFor(account, 'a.jpg')).exists(), isFalse);
-        expect(sink.removed, {'a.jpg'});
         expect(purgedEntriesFor, ['acc1']);
         expect(states.states.containsKey(account.id), isFalse);
         expect(accounts.accounts['acc1'], change);
@@ -158,7 +153,6 @@ void main() {
       expect(await useCase.remove(account), isTrue);
       expect(credentials.passwords, isEmpty);
       expect(mirror.rows(account), isEmpty);
-      expect(sink.removed, {'a.jpg'});
       expect(purgedEntriesFor, ['acc1']);
       expect(states.states.containsKey(account.id), isFalse);
       expect(accounts.accounts, isEmpty);
@@ -171,13 +165,12 @@ void main() {
       expect(await useCase.remove(account), isFalse);
       expect(accounts.accounts.keys, {'acc1'});
       expect(mirror.rows(account).keys, {'a.jpg'});
-      expect(sink.removed, isEmpty);
+      expect(purgedEntriesFor, isEmpty);
     });
   });
 
   test('purge removes entries even when the index has no rows', () async {
     await useCase.purge(account);
-    expect(sink.removals, isEmpty);
     expect(purgedEntriesFor, ['acc1']);
   });
 }

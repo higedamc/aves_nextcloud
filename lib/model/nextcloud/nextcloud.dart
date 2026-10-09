@@ -67,7 +67,6 @@ class Nextcloud {
       accounts: accountStore,
       credentials: credentialStore,
       mirror: mirrorStore,
-      sink: sink,
       states: states,
       removeAllEntries: sink.removeAccountEntries,
     );
@@ -84,6 +83,14 @@ class Nextcloud {
   ValueListenable<NextcloudSyncStatus> statusOf(String accountId) => _statusNotifier(accountId);
 
   ValueNotifier<NextcloudSyncStatus> _statusNotifier(String accountId) => _statuses.putIfAbsent(accountId, () => ValueNotifier(NextcloudSyncStatus.idle));
+
+  // Drops and disposes a removed account's status notifier. Nothing in the account lifecycle calls this on its
+  // own: `_statuses` is a field of this singleton, not of `NextcloudAccountUseCase`, so the UI that drives a
+  // removal has to call it after the removal succeeds. The caller should defer this past the frame that
+  // unmounts the account's own tile (e.g. `addPostFrameCallback`): that tile's `ValueListenableBuilder` is
+  // still subscribed until its own `State.dispose()` runs, and disposing a notifier out from under a live
+  // listener throws on its next `removeListener`.
+  void disposeStatus(String accountId) => _statuses.remove(accountId)?.dispose();
 
   // Runs one sync for `account`. Returns null when a sync for it is already running (the use case would queue it,
   // but a second user tap should not double the work). A `NextcloudFailure` is reported in the result; anything

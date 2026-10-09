@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/credential_store.dart';
@@ -113,7 +115,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           // A row at a later tier than wanted is current (an original answers for a placeholder), so an
           // already-held video is never downgraded when the threshold drops below its size; a row at an
           // earlier tier is not, so raising the threshold promotes a placeholder to an original.
-          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath) && row.satisfies(_wantedTier(account, item));
+          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath) && _holds(row, _wantedTier(account, item));
           if (current && !request.force) {
             stats.skipped++;
           } else {
@@ -201,20 +203,63 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       if (row.etag != item.etag && !fetched.contains(path)) return false;
       // a row below the wanted tier (a placeholder video whose threshold was raised, left there by the
       // budget) is a gap: promising the subtree would skip it on every later run and never promote it
-      if (!row.satisfies(_wantedTier(account, item))) return false;
+      if (!_holds(row, _wantedTier(account, item))) return false;
       if (row.tier == NextcloudMirrorTier.placeholder) continue;
       if (!await File(_mirror.localPathFor(account, path)).exists()) return false;
     }
     return true;
   }
 
-  // The tier this run wants for an item. First cut: everything is mirrored as an original except a video
-  // above `videoAutoDownloadLimitBytes`, which gets a `placeholder` row and is streamed on demand instead.
-  // The grid and view tiers for images arrive with the budget work; this is the only place that decides.
+  // The tier a sync wants for an item; the only place that decides.
+  //
+  // An image is held as its `grid` derivative (the `x=256` bucket: 192x256 at a measured mean of 18 KB,
+  // 0.41 GB for a 22,000-image library). The `view` tier is fetched when an item is opened, never by the
+  // sync, and the `original` only on an explicit download. A video is held whole below
+  // `videoAutoDownloadLimitBytes`, since the server cannot derive anything from it, and as a `placeholder`
+  // above, streamed on demand.
   static NextcloudMirrorTier _wantedTier(NextcloudAccount account, NextcloudRemoteItem item) {
-    if (item.isVideo && item.sizeBytes > account.videoAutoDownloadLimitBytes) return NextcloudMirrorTier.placeholder;
-    return NextcloudMirrorTier.original;
+    if (item.isVideo) {
+      return item.sizeBytes > account.videoAutoDownloadLimitBytes ? NextcloudMirrorTier.placeholder : NextcloudMirrorTier.original;
+    }
+    return NextcloudMirrorTier.grid;
   }
+
+  // Whether a row answers for the tier a run wants. Tier order decides it, with one policy on top: a
+  // `placeholder` answers for `grid`, because it is what a run records when the server cannot derive the
+  // item at all (HEIC under the default providers answers 404), and nothing more can be done for it until
+  // the file changes. It does not answer for `original`, which is a video the threshold now admits whole:
+  // that row is a gap to be promoted, not an outcome.
+  static bool _holds(NextcloudMirrorIndexEntry row, NextcloudMirrorTier wanted) {
+    if (row.satisfies(wanted)) return true;
+    return row.tier == NextcloudMirrorTier.placeholder && wanted == NextcloudMirrorTier.grid;
+  }
+
+  // The tier a run fetches: the wanted one, unless the row already holds more. A `force` run re-fetches
+  // every listed item, and it must re-fetch what is held rather than what is wanted, or forcing would
+  // silently downgrade every original (every row migrated from v1) to a preview.
+  static NextcloudMirrorTier _fetchTier(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing) {
+    final wanted = _wantedTier(account, item);
+    if (existing != null && existing.tier.index > wanted.index) return existing.tier;
+    return wanted;
+  }
+
+  // Long edge requested for the grid tier. Fixed, not keyed to the column count, which is a live
+  // pinch-to-zoom setting: a tier that followed it would refetch the library on a pinch.
+  static const gridEdgePx = 256;
+
+  // Reservation ceilings for derivative tiers. A derivative's byte size is unknowable before the fetch, so
+  // the budget reserves a ceiling and then accounts the size the store read back from disk. The ceilings
+  // are generous multiples of the measured means (18 KB grid, 135 KB view) and are capped by the original's
+  // size, which a derivative never exceeds by more than re-encoding noise.
+  static const gridReserveBytes = 64 * 1024;
+  static const viewReserveBytes = 512 * 1024;
+
+  static int _reserveFor(NextcloudRemoteItem item, NextcloudMirrorTier tier) => switch (tier) {
+    NextcloudMirrorTier.placeholder => 0,
+    NextcloudMirrorTier.grid => math.min(item.sizeBytes, gridReserveBytes),
+    NextcloudMirrorTier.view => math.min(item.sizeBytes, viewReserveBytes),
+    NextcloudMirrorTier.original => item.sizeBytes,
+  };
 
   // returns the paths fetched in this run
   Future<Set<String>> _download(
@@ -238,40 +283,18 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     // a placeholder costs nothing: left in the same list, every above-threshold video behind the break
     // would end the run with no row, no entry and no failure, counted as skipped by a budget that has no
     // bearing on it. Which videos appeared in the gallery would then depend on where the break fell.
-    final placeholders = downloads.where((item) => _wantedTier(account, item) == NextcloudMirrorTier.placeholder).toList();
-    final fetches = downloads.where((item) => _wantedTier(account, item) != NextcloudMirrorTier.placeholder).toList();
+    NextcloudMirrorTier tierOf(NextcloudRemoteItem item) => _fetchTier(account, item, rows[item.relativePath]);
+    final placeholders = downloads.where((item) => tierOf(item) == NextcloudMirrorTier.placeholder).toList();
+    final fetches = downloads.where((item) => tierOf(item) != NextcloudMirrorTier.placeholder).toList();
 
     for (final item in placeholders) {
       _checkCancelled(cancellation);
       final path = item.relativePath;
-      final existing = rows[path];
       try {
-        // no bytes, so no budget, no eviction and no download: the row and the entry are all there is
-        await _mirror.record(
-          account,
-          NextcloudMirrorIndexEntry(
-            relativePath: path,
-            etag: item.etag,
-            fileId: item.fileId,
-            tier: NextcloudMirrorTier.placeholder,
-            remoteSizeBytes: item.sizeBytes,
-            localSizeBytes: 0,
-            remoteLastModified: item.lastModified,
-            downloadedAt: _now(),
-            lastAccessAt: existing?.lastAccessAt ?? _now(),
-          ),
-        );
-        if (!await _sink.putPlaceholder(account, item)) {
-          // a row with no entry would be skipped by etag forever: drop it so the next run retries
-          await _mirror.remove(account, path);
-          throw NextcloudLocalStorageFailure('could not create a placeholder entry for $path');
-        }
+        await _recordPlaceholder(account, item, rows[path], stats);
+        // Coupled to the eviction-touched break below, which reads this set: it cannot false-trigger on a
+        // placeholder today only because a placeholder is never an eviction candidate.
         fetchedThisRun.add(path);
-        if (existing == null) {
-          stats.added++;
-        } else {
-          stats.updated++;
-        }
       } on NextcloudFailure catch (e) {
         if (_isFatal(e)) rethrow;
         stats.itemFailures[path] = e;
@@ -285,18 +308,20 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       final item = fetches[i];
       final path = item.relativePath;
       final existing = rows[path];
+      final tier = tierOf(item);
+      final reserve = _reserveFor(item, tier);
       try {
-        if (item.sizeBytes > account.cacheLimitBytes) {
+        if (reserve > account.cacheLimitBytes) {
           // never empty the whole mirror for a file that cannot fit anyway
-          throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes);
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes);
         }
-        if (fetchedBytes + item.sizeBytes > account.cacheLimitBytes) {
+        if (fetchedBytes + reserve > account.cacheLimitBytes) {
           // the budget is full of this run's newest files; the rest are older and would only thrash
           stats.skipped += fetches.length - i;
           break;
         }
         // make room first; whatever goes must leave the collection in the same step
-        final eviction = await _mirror.evictToFit(account, reserveBytes: item.sizeBytes);
+        final eviction = await _mirror.evictToFit(account, reserveBytes: reserve);
         if (!eviction.isEmpty) {
           await _applyEviction(account, eviction, stats);
           // `touched`, not `removed`: a file this run fetched is just as lost to it if the store demoted
@@ -309,48 +334,72 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           }
         }
         final used = await _mirror.usedBytes(account);
-        if (used + item.sizeBytes > account.cacheLimitBytes) {
-          throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes - used);
+        if (used + reserve > account.cacheLimitBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes - used);
         }
 
         final localPath = _mirror.localPathFor(account, path);
-        var itemBytes = 0;
-        final observedEtag = await repository.downloadTo(
-          item,
-          localPath,
-          onProgress: (received, _) {
-            bytesDone += received - itemBytes;
-            itemBytes = received;
+        String? observedEtag;
+        int localBytes;
+        if (tier == NextcloudMirrorTier.original) {
+          var itemBytes = 0;
+          observedEtag = await repository.downloadTo(
+            item,
+            localPath,
+            onProgress: (received, _) {
+              bytesDone += received - itemBytes;
+              itemBytes = received;
+              emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
+            },
+            cancellation: cancellation,
+          );
+          localBytes = item.sizeBytes;
+        } else {
+          final Uint8List bytes;
+          try {
+            bytes = await repository.fetchPreview(item, width: gridEdgePx, height: gridEdgePx);
+          } on NextcloudPreviewUnavailableFailure {
+            // the server cannot derive this one (HEIC and HEIF under the default providers): the item is
+            // still listed, so it gets a placeholder row, which the completeness rule admits
+            await _recordPlaceholder(account, item, existing, stats);
+            fetchedThisRun.add(path);
+            done++;
             emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
-          },
-          cancellation: cancellation,
-        );
+            continue;
+          }
+          _checkCancelled(cancellation);
+          await _writeThrough(localPath, bytes, modified: item.lastModified);
+          localBytes = bytes.length;
+          bytesDone += bytes.length;
+          emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
+        }
         final now = _now();
         await _mirror.record(
           account,
           NextcloudMirrorIndexEntry(
             relativePath: path,
-            // the etag the bytes actually have, which may be newer than the listing's
+            // the etag the bytes actually have, which may be newer than the listing's; a derivative carries
+            // the listing's, since the preview endpoint answers for the file as listed
             etag: observedEtag ?? item.etag,
             fileId: item.fileId,
-            // this run mirrors whole files, so the tier is `original` and the two sizes agree; the store
-            // reads the local size back from disk either way
-            tier: NextcloudMirrorTier.original,
+            tier: tier,
             remoteSizeBytes: item.sizeBytes,
-            localSizeBytes: item.sizeBytes,
+            // the store reads the local size back from disk either way
+            localSizeBytes: localBytes,
             remoteLastModified: item.lastModified,
             downloadedAt: now,
             // a server-side change is not a view: keep the LRU position of a refreshed file
             lastAccessAt: existing?.lastAccessAt ?? now,
           ),
         );
-        if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.original)) {
+        if (!await _sink.putMirroredFile(account, item, localPath, tier)) {
           // mirrored but invisible would be skipped by etag forever: drop the bytes so the next run retries
           await _mirror.remove(account, path);
           throw NextcloudLocalStorageFailure('could not create an entry for $path');
         }
         fetchedThisRun.add(path);
-        fetchedBytes += item.sizeBytes;
+        // accounted after the fetch, with the bytes that actually landed, not the reservation
+        fetchedBytes += localBytes;
         if (existing == null) {
           stats.added++;
         } else {
@@ -364,6 +413,57 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
     }
     return fetchedThisRun;
+  }
+
+  // No bytes, so no budget, no eviction and no download: the row and the entry are all there is. A
+  // placeholder the sink refuses is removed again, since a row with no entry would be skipped by etag forever.
+  Future<void> _recordPlaceholder(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing, _Stats stats) async {
+    final path = item.relativePath;
+    await _mirror.record(
+      account,
+      NextcloudMirrorIndexEntry(
+        relativePath: path,
+        etag: item.etag,
+        fileId: item.fileId,
+        tier: NextcloudMirrorTier.placeholder,
+        remoteSizeBytes: item.sizeBytes,
+        localSizeBytes: 0,
+        remoteLastModified: item.lastModified,
+        downloadedAt: _now(),
+        lastAccessAt: existing?.lastAccessAt ?? _now(),
+      ),
+    );
+    if (!await _sink.putPlaceholder(account, item)) {
+      await _mirror.remove(account, path);
+      throw NextcloudLocalStorageFailure('could not create a placeholder entry for $path');
+    }
+    if (existing == null) {
+      stats.added++;
+    } else {
+      stats.updated++;
+    }
+  }
+
+  // Writes derivative bytes the same way `downloadTo` writes an original: beside, then rename, so a crash
+  // leaves a `.part` for the sweep and never a half-written file under a path the index could trust. The
+  // mtime is the server's for the same reason as there: a preview carries no Exif, so the file date is the
+  // only date the entry has until the catalogue learns it from the properties.
+  Future<void> _writeThrough(String localPath, List<int> bytes, {required DateTime modified}) async {
+    final target = File(localPath);
+    final part = File('$localPath.part');
+    await target.parent.create(recursive: true);
+    try {
+      await part.writeAsBytes(bytes, flush: true);
+      await part.rename(localPath);
+    } catch (e) {
+      if (await part.exists()) await part.delete();
+      throw NextcloudLocalStorageFailure('could not write $localPath', cause: e);
+    }
+    try {
+      await target.setLastModified(modified);
+    } catch (_) {
+      // best effort: the bytes are complete and in place, and a date is not worth an orphan file
+    }
   }
 
   Future<void> _drop(NextcloudAccount account, Set<String> paths, _Stats stats, {required bool countAsRemoved}) async {

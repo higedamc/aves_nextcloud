@@ -58,6 +58,9 @@ class FakeNextcloudRepository implements NextcloudRepository {
   final List<String> listedRoots = [];
   final List<Map<String, String>> knownEtagsReceived = [];
   final List<String> downloads = [];
+
+  // every byte request in order, originals and previews alike, for assertions about fetch order
+  final List<String> fetched = [];
   // listings that went past the root check and enumerated the scope
   int enumerations = 0;
 
@@ -156,6 +159,7 @@ class FakeNextcloudRepository implements NextcloudRepository {
     final failure = downloadFailures[item.relativePath];
     if (failure != null) throw failure;
     downloads.add(item.relativePath);
+    fetched.add(item.relativePath);
     final bytes = bodies[item.relativePath] ?? List.filled(item.sizeBytes, 0);
     final part = File('$localPath.part');
     await part.parent.create(recursive: true);
@@ -165,8 +169,23 @@ class FakeNextcloudRepository implements NextcloudRepository {
     return item.etag;
   }
 
+  // preview requests, in order, as `path@WIDTHxHEIGHT`; the bytes are `previewBytes` zeros unless a body is given
+  final List<String> previews = [];
+  final Map<String, NextcloudFailure> previewFailures = {};
+  final Map<String, List<int>> previewBodies = {};
+  int previewBytes = 2;
+
   @override
-  Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height}) => throw UnimplementedError();
+  Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height}) async {
+    final failure = previewFailures[item.relativePath];
+    if (failure != null) throw failure;
+    previews.add('${item.relativePath}@${width}x$height');
+    fetched.add(item.relativePath);
+    return Uint8List.fromList(previewBodies[item.relativePath] ?? List.filled(previewBytes, 0));
+  }
+
+  // paths requested as previews, without the size suffix
+  List<String> get previewPaths => previews.map((v) => v.substring(0, v.lastIndexOf('@'))).toList();
 
   @override
   Future<Uint8List> fetchPoster(NextcloudRemoteItem item, {required int width, required int height}) => throw UnimplementedError();

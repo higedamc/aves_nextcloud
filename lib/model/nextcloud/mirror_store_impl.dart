@@ -78,6 +78,11 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   @override
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry) async {
     final normalized = _requireNormalized(entry.relativePath);
+    if (entry.tier == NextcloudMirrorTier.placeholder) {
+      // no bytes by design, so there is nothing to stat and nothing to read back
+      await _index.put(account, entry.copyWith(localSizeBytes: 0));
+      return;
+    }
     final file = File(localPathFor(account, normalized));
     final stat = await file.stat();
     if (stat.type != FileSystemEntityType.file) {
@@ -129,7 +134,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   static const _evictionPageSize = 256;
 
   @override
-  Future<Set<String>> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
+  Future<NextcloudEvictionOutcome> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
     final budget = account.cacheLimitBytes - reserveBytes;
     final target = budget < 0 ? 0 : budget;
 
@@ -167,7 +172,13 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     }
     // `used > target` here means even an empty mirror cannot hold the reservation; the caller decides
     // whether that is a `NextcloudQuotaFailure`. Everything evicted is reported either way.
-    return evicted;
+    //
+    // `demoted` is always empty here, and that is the honest state of this implementation rather than an
+    // oversight: nothing fetches the `view` tier yet, so no row has a cheaper tier to fall back to. The
+    // contract carries the outcome now so the leaf that adds the view tier can fill it in without changing
+    // this signature while other leaves are in flight — and so that no caller is written against a return
+    // type that can only say "removed".
+    return NextcloudEvictionOutcome(removed: evicted);
   }
 
   @override

@@ -88,6 +88,9 @@ class _Server {
   // a raw response injected into the root listing
   String? injectedRootResponse;
 
+  // advertise SEARCH but answer it with 400, so the fallback crawl is taken
+  bool rejectSearch = false;
+
   new({this.supportsSearch = true});
 
   String _withInjected(String body) {
@@ -144,6 +147,7 @@ class _Server {
         }
         return http.Response(key == '$_davFiles/' ? _withInjectedRoot(_withInjected(body)) : body, 207);
       case 'SEARCH':
+        if (rejectSearch) return http.Response('', 400);
         expect(path, '/remote.php/dav/');
         expect(request.body, contains('<d:href>/files/alice/Photos</d:href>'));
         expect(request.body, contains('<d:depth>infinity</d:depth>'));
@@ -173,7 +177,54 @@ void main() {
     final server = _Server();
     final items = await _repo(server).listMediaTree('').toList();
     expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4']);
-    expect(server.requests.where((r) => r.method == 'PROPFIND'), isEmpty);
+    // the only PROPFIND is the Depth 0 stat of the root; nothing is crawled
+    expect(server.requests.where((r) => r.method == 'PROPFIND').length, 1);
+    expect(server.propfindDepthByPath, {'$_davFiles/': 0});
+    expect(server.requests.where((r) => r.method == 'SEARCH').length, 1);
+  });
+
+  test('SEARCH publishes the root etag, and only the root, once the whole scope was enumerated', () async {
+    final server = _Server();
+    // items and collections in the order they came out, so the post-order rule can be checked
+    final events = <String>[];
+    await for (final item in _repo(server).listMediaTree('', onCollection: (c) => events.add('collection:${c.relativePath}=${c.etag}'))) {
+      events.add('item:${item.relativePath}');
+    }
+    expect(events, ['item:a.jpg', 'item:Sub/b.mp4', 'collection:=root-v1']);
+  });
+
+  test('SEARCH is not issued at all when the root etag is unchanged', () async {
+    final server = _Server();
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', knownCollectionEtags: {'': 'root-v1'}, onCollection: collections.add).toList();
+    expect(items, isEmpty);
+    expect(collections.map((v) => '${v.relativePath}=${v.etag}'), ['=root-v1']);
+    expect(server.requests.where((r) => r.method == 'SEARCH'), isEmpty);
+    expect(server.propfindDepthByPath, {'$_davFiles/': 0});
+
+    // a sub-collection etag means nothing to the SEARCH strategy: the scope is queried in full
+    final subOnly = _Server();
+    final again = await _repo(subOnly).listMediaTree('', knownCollectionEtags: {'Sub': 'sub-v1'}).toList();
+    expect(again.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4']);
+    expect(subOnly.requests.where((r) => r.method == 'SEARCH').length, 1);
+  });
+
+  test('a root that cannot be listed fails the SEARCH strategy before any query', () async {
+    final server = _Server();
+    await expectLater(_repo(server).listMediaTree('Nope').toList(), throwsA(isA<NextcloudNotFoundFailure>()));
+    expect(server.requests.where((r) => r.method == 'SEARCH'), isEmpty);
+  });
+
+  test('a rejected SEARCH falls back to the crawl, which stats the root once and publishes per collection', () async {
+    final server = _Server()..rejectSearch = true;
+    final collections = <NextcloudRemoteItem>[];
+    final items = await _repo(server).listMediaTree('', onCollection: collections.add).toList();
+    expect(items.map((v) => v.relativePath), ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']);
+    expect(collections.map((v) => '${v.relativePath}=${v.etag}'), ['Sub/Deep=deep-v1', 'Sub=sub-v1', '=root-v1']);
+    expect(server.requests.where((r) => r.method == 'SEARCH').length, 1);
+    // one Depth 0 stat before the strategy choice, then the Depth 1 crawl: the root is not stat'd again
+    expect(server.requests.where((r) => r.method == 'PROPFIND' && r.headers['depth'] == '0').length, 1);
+    expect(server.propfindDepthByPath['$_davFiles/'], 1);
   });
 
   test('listMediaTree crawls with PROPFIND Depth 1 when SEARCH is unavailable, recursing into sub-folders', () async {
@@ -315,6 +366,9 @@ void main() {
           return http.Response('', 200, headers: {'Allow': 'OPTIONS, PROPFIND, SEARCH'});
         case 'GET':
           return http.Response('{}', 200);
+        case 'PROPFIND':
+          expect(request.headers['depth'], '0');
+          return http.Response(_multistatus([_collection('$_davFiles/', 'root-v1')]), 207);
         case 'SEARCH':
           final offset = _offsetOf(request.body);
           offsets.add(offset);
@@ -325,23 +379,29 @@ void main() {
     // page 0: full, every response outside the root (all holes); page 1: short, one item
     const outside = '/remote.php/dav/files/alice/Documents/x.jpg';
     final holesThenItem = <int>[];
+    final holesCollections = <NextcloudRemoteItem>[];
     final items = await WebDavNextcloudRepository(
       _account,
       _credentials,
       client: clientWith((offset) => offset == 0 ? _multistatus([for (var i = 0; i < pageSize; i++) _file(outside, 'v', fileId: i)]) : _multistatus([_file('$_davFiles/last.jpg', 'v', fileId: 1)]), holesThenItem),
-    ).listMediaTree('', onItemFailure: (_, _) {}).toList();
+    ).listMediaTree('', onItemFailure: (_, _) {}, onCollection: holesCollections.add).toList();
     expect(holesThenItem, [0, pageSize]);
     expect(items.map((v) => v.relativePath), ['last.jpg']);
+    // the holes were reported: the scope was not fully enumerated, so the root is not published
+    expect(holesCollections, isEmpty);
 
     // a server that ignores the offset returns the same full page forever: stop after the first repeat
     final ignoresOffset = <int>[];
+    final ignoredCollections = <NextcloudRemoteItem>[];
     final repeated = await WebDavNextcloudRepository(
       _account,
       _credentials,
       client: clientWith((_) => _multistatus([for (var i = 0; i < pageSize; i++) _file('$_davFiles/p$i.jpg', 'v', fileId: i)]), ignoresOffset),
-    ).listMediaTree('').toList();
+    ).listMediaTree('', onCollection: ignoredCollections.add).toList();
     expect(ignoresOffset, [0, pageSize]);
     expect(repeated.length, pageSize);
+    // the pages past the first were never served: nothing vouches for the whole scope
+    expect(ignoredCollections, isEmpty);
   });
 
   test('SEARCH paging counts responses, not items, so a page with a hole is not mistaken for the last one', () async {
@@ -353,6 +413,8 @@ void main() {
           return http.Response('', 200, headers: {'Allow': 'OPTIONS, PROPFIND, SEARCH'});
         case 'GET':
           return http.Response('{}', 200);
+        case 'PROPFIND':
+          return http.Response(_multistatus([_collection('$_davFiles/', 'root-v1')]), 207);
         case 'SEARCH':
           final offset = _offsetOf(request.body);
           offsets.add(offset);
@@ -367,11 +429,15 @@ void main() {
     });
     final repo = WebDavNextcloudRepository(_account, _credentials, client: client);
     final failures = <String, NextcloudFailure>{};
-    final items = await repo.listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure).toList();
+    final collections = <NextcloudRemoteItem>[];
+    final items = await repo.listMediaTree('', onItemFailure: (path, failure) => failures[path] = failure, onCollection: collections.add).toList();
     expect(offsets, [0, pageSize]);
     expect(items.length, pageSize);
     expect(items.last.relativePath, 'last.jpg');
     expect(failures.keys, ['/remote.php/dav/files/alice/Documents/x.jpg']);
+    // one response the server could not place inside the root: that file would never be retried if the
+    // root were published now
+    expect(collections, isEmpty);
   });
 
   test('listCollection and stat', () async {

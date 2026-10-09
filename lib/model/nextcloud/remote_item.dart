@@ -56,7 +56,8 @@ class NextcloudRemoteItem {
 }
 
 // Server-side extracted photo metadata (Nextcloud 28+ `nc:metadata-photos-size`, `-original_date_time`, `-gps`).
-// Optional hint only: the local catalog pipeline remains the source of truth once the file is mirrored.
+// For any tier below `original` this is the only source for date and GPS: a preview carries none of its
+// own (measured, 93 Exif tags in the original and 0 in the preview). See `catalogMetadataFromPhotoMetadata`.
 class NextcloudPhotoMetadata {
   final int? width, height;
   final DateTime? originalDateTime;

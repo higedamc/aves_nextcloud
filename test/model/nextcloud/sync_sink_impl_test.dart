@@ -6,6 +6,7 @@ import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/favourites.dart';
 import 'package:aves/model/filters/covered/stored_album.dart';
+import 'package:aves/model/metadata/catalog.dart';
 import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/placeholder_entries.dart';
@@ -29,6 +30,8 @@ class RecordingDb extends FakeAvesDb {
   final List<Set<AvesEntry>> inserts = [];
   final List<(int, AvesEntry)> updates = [];
   final List<(Set<int>, Set<EntryDataType>?)> removals = [];
+  final List<CatalogMetadata> catalogSaves = [];
+  final List<(int, CatalogMetadata?)> catalogUpdates = [];
 
   // not `reset()`: `LocalMediaDb.reset()` exists with a different signature
   void clearRecords() {
@@ -36,6 +39,8 @@ class RecordingDb extends FakeAvesDb {
     inserts.clear();
     updates.clear();
     removals.clear();
+    catalogSaves.clear();
+    catalogUpdates.clear();
   }
 
   @override
@@ -70,6 +75,16 @@ class RecordingDb extends FakeAvesDb {
       ids.forEach(rows.remove);
     }
   }
+
+  @override
+  Future<void> saveCatalogMetadata(Set<CatalogMetadata> metadataEntries) async {
+    catalogSaves.addAll(metadataEntries);
+  }
+
+  @override
+  Future<void> updateCatalogMetadata(int id, CatalogMetadata? metadata) async {
+    catalogUpdates.add((id, metadata));
+  }
 }
 
 void main() {
@@ -89,7 +104,7 @@ void main() {
   final localA = mirror.localPathFor(account, relA), localB = mirror.localPathFor(account, relB);
   final uriA = Uri.file(localA).toString(), uriB = Uri.file(localB).toString();
 
-  NextcloudRemoteItem itemFor(String relativePath) => NextcloudRemoteItem(
+  NextcloudRemoteItem itemFor(String relativePath, {NextcloudPhotoMetadata? photoMetadata}) => NextcloudRemoteItem(
     relativePath: relativePath,
     fileId: null,
     etag: 'e-$relativePath',
@@ -97,11 +112,21 @@ void main() {
     sizeBytes: 42,
     lastModified: DateTime.utc(2024),
     isCollection: false,
+    photoMetadata: photoMetadata,
   );
 
   // the same modification date everywhere: a refresh that sees a changed date calls `clearDecoders()`,
-  // which the fake services do not implement, so this is what keeps a refresh on the fake-safe path
-  AvesEntry entryAt(String localPath, {required int id, required int origin, int sizeBytes = 42}) => AvesEntry(
+  // which the fake services do not implement, so this is what keeps a refresh on the fake-safe path.
+  // `sourceDateTakenMillis`/`dateModifiedMillis` are overridable because one test needs an entry with
+  // neither, to match a real preview's bytes (no Exif of its own) rather than this fixture's default.
+  AvesEntry entryAt(
+    String localPath, {
+    required int id,
+    required int origin,
+    int sizeBytes = 42,
+    int? sourceDateTakenMillis = 1000,
+    int? dateModifiedMillis = 1000,
+  }) => AvesEntry(
     id: id,
     uri: Uri.file(localPath).toString(),
     path: localPath,
@@ -114,15 +139,22 @@ void main() {
     sizeBytes: sizeBytes,
     sourceTitle: 'photo',
     dateAddedSecs: 1,
-    dateModifiedMillis: 1000,
-    sourceDateTakenMillis: 1000,
+    dateModifiedMillis: dateModifiedMillis,
+    sourceDateTakenMillis: sourceDateTakenMillis,
     durationMillis: null,
     trashed: false,
     origin: origin,
   );
 
   // what `mediaFetchService.getEntry` answers for a mirrored file
-  AvesEntry fetched(String localPath, {int sizeBytes = 42}) => entryAt(localPath, id: 0, origin: EntryOrigins.file, sizeBytes: sizeBytes);
+  AvesEntry fetched(String localPath, {int sizeBytes = 42, int? sourceDateTakenMillis = 1000, int? dateModifiedMillis = 1000}) => entryAt(
+    localPath,
+    id: 0,
+    origin: EntryOrigins.file,
+    sizeBytes: sizeBytes,
+    sourceDateTakenMillis: sourceDateTakenMillis,
+    dateModifiedMillis: dateModifiedMillis,
+  );
 
   // a stored `origin = nextcloud` row
   AvesEntry row(String localPath, {required int id}) => entryAt(localPath, id: id, origin: EntryOrigins.nextcloud);
@@ -225,6 +257,111 @@ void main() {
     expect(removedIds, {7});
     expect(removedTypes, {EntryDataType.catalog, EntryDataType.address});
     expect(source.allEntries, isEmpty);
+  });
+
+  group('catalogue from server metadata', () {
+    final serverMetadata = NextcloudPhotoMetadata(
+      width: 4032,
+      height: 3024,
+      originalDateTime: DateTime.utc(2023, 5, 6, 12),
+      latitude: 35.6895,
+      longitude: 139.6917,
+    );
+
+    test('a preview tier put carries the server date and GPS into a new entry, and persists them', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA, photoMetadata: serverMetadata), localA, NextcloudMirrorTier.grid), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.isCatalogued, isTrue);
+      expect(inserted.catalogMetadata!.dateMillis, serverMetadata.originalDateTime!.millisecondsSinceEpoch);
+      expect(inserted.catalogMetadata!.latitude, serverMetadata.latitude);
+      expect(inserted.catalogMetadata!.longitude, serverMetadata.longitude);
+      // `insertEntries` only writes the entry row, and `analyze()` would skip this entry because it is
+      // already catalogued, so without an explicit save the catalog data would never reach the DB
+      expect(db.catalogSaves, [inserted.catalogMetadata]);
+    });
+
+    test('an original tier put leaves cataloguing to the device, as before', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA, photoMetadata: serverMetadata), localA, NextcloudMirrorTier.original), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.isCatalogued, isFalse, reason: 'the original keeps full device-side Exif cataloguing, not just date and GPS');
+      expect(db.catalogSaves, isEmpty);
+    });
+
+    test('a preview tier refresh overrides stale server date and GPS without forcing a device recatalog', () async {
+      db.rows[1] = row(localA, id: 1);
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sizeBytes: 99)};
+      // the fake metadata service has nothing set up for this entry, so a forced `entry.catalog()` call
+      // here would answer `null` and wipe the entry's catalog metadata entirely: this is the negative
+      // control for the fix, reached by deleting the `if (presetCatalog == null) EntryDataType.catalog`
+      // guard in `_putEntry`, which turns this assertion into `isCatalogued: false`.
+
+      expect(await sink.putMirroredFile(account, itemFor(relA, photoMetadata: serverMetadata), localA, NextcloudMirrorTier.grid), isTrue);
+
+      final refreshed = source.getEntryById(1)!;
+      expect(refreshed.isCatalogued, isTrue);
+      expect(refreshed.catalogMetadata!.dateMillis, serverMetadata.originalDateTime!.millisecondsSinceEpoch);
+      expect(refreshed.catalogMetadata!.latitude, serverMetadata.latitude);
+      expect(refreshed.catalogMetadata!.longitude, serverMetadata.longitude);
+      expect(db.catalogUpdates.map((update) => update.$1), contains(1));
+    });
+
+    test('a preview tier put to a row outside the collection persists the server date and GPS instead of dropping them', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      db.rows[7] = row(localA, id: 7);
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sizeBytes: 99)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA, photoMetadata: serverMetadata), localA, NextcloudMirrorTier.grid), isTrue);
+
+      final (updatedId, updated) = db.updates.single;
+      expect(updatedId, 7);
+      expect(updated.catalogMetadata!.dateMillis, serverMetadata.originalDateTime!.millisecondsSinceEpoch);
+      expect(updated.catalogMetadata!.latitude, serverMetadata.latitude);
+      expect(db.catalogUpdates.map((update) => update.$1), contains(7));
+    });
+
+    test('a preview tier with no server date or GPS leaves the entry visibly unknown, not a zero', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      // a real preview carries no Exif of its own (see `catalog_from_metadata.dart`), so this fixture drops
+      // the shared fixture's `sourceDateTakenMillis`/`dateModifiedMillis` fallback to match
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sourceDateTakenMillis: null, dateModifiedMillis: null)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.grid), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.isCatalogued, isTrue);
+      expect(inserted.catalogMetadata!.dateMillis, isNull);
+      expect(inserted.bestDate, isNull, reason: 'no catalog, source-taken or modified date is available either, for this fixture');
+      expect(inserted.hasGps, isFalse);
+    });
+
+    test('dimensions come from the local bytes, never from the server prop', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      // the fixture's preview bytes report 360x720 (`entryAt`); the server prop below disagrees on both
+      // dimensions and orientation, which is the shape measured on the real server (un-rotated original
+      // metadata against a preview with the rotation already burned in)
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA)};
+
+      expect(await sink.putMirroredFile(account, itemFor(relA, photoMetadata: serverMetadata), localA, NextcloudMirrorTier.grid), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.width, 360);
+      expect(inserted.height, 720);
+    });
   });
 
   test('removing files cleans up rows, favourites and covers in and out of the collection', () async {

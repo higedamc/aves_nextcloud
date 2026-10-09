@@ -59,19 +59,29 @@ abstract class NextcloudSyncSink {
 // is an original) does not look like a mirror full of holes.
 class NextcloudSyncState {
   final Map<String, String> collectionEtags;
-  final int cacheLimitBytes;
 
-  const new({this.collectionEtags = const {}, this.cacheLimitBytes = 0});
+  // The limits the etags were earned under. A raised limit makes items wanted that the promised subtrees
+  // skipped, so the next run must list everything; both default to 0 when absent, so a state written
+  // before the field existed reads as "lower than whatever is set now" and costs exactly one full listing.
+  final int cacheLimitBytes;
+  final int videoAutoDownloadLimitBytes;
+
+  const new({this.collectionEtags = const {}, this.cacheLimitBytes = 0, this.videoAutoDownloadLimitBytes = 0});
 
   static const empty = NextcloudSyncState();
 
-  Map<String, dynamic> toJson() => {'collectionEtags': collectionEtags, 'cacheLimitBytes': cacheLimitBytes};
+  Map<String, dynamic> toJson() => {'collectionEtags': collectionEtags, 'cacheLimitBytes': cacheLimitBytes, 'videoAutoDownloadLimitBytes': videoAutoDownloadLimitBytes};
+
+  static int _intOrZero(Object? value) => value is int ? value : 0;
 
   factory fromJson(Map<String, dynamic> json) {
     final etags = json['collectionEtags'];
     return NextcloudSyncState(
       collectionEtags: etags is Map ? etags.map((k, v) => MapEntry(k.toString(), v.toString())) : const {},
-      cacheLimitBytes: json['cacheLimitBytes'] as int? ?? 0,
+      // tolerant of a wrong type, not only a missing key: the file is ours, but a cast that throws here
+      // would fail every sync until the file is deleted, and `load` only catches malformed JSON
+      cacheLimitBytes: _intOrZero(json['cacheLimitBytes']),
+      videoAutoDownloadLimitBytes: _intOrZero(json['videoAutoDownloadLimitBytes']),
     );
   }
 }

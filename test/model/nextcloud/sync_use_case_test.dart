@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/errors.dart';
+import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 import 'package:aves/model/nextcloud/repository.dart';
 import 'package:aves/model/nextcloud/sync.dart';
@@ -19,12 +20,13 @@ void main() {
   late FakeNextcloudCredentialStore credentials;
   var clock = DateTime.utc(2026, 10, 9, 12);
 
-  NextcloudAccount accountWith({int cacheLimitBytes = 1000, String id = 'acc1'}) => NextcloudAccount(
+  NextcloudAccount accountWith({int cacheLimitBytes = 1000, String id = 'acc1', int videoAutoDownloadLimitBytes = NextcloudAccount.defaultVideoAutoDownloadLimitBytes}) => NextcloudAccount(
     id: id,
     serverUrl: Uri.parse('https://cloud.example.com'),
     username: 'alice',
     rootFolder: 'Photos',
     cacheLimitBytes: cacheLimitBytes,
+    videoAutoDownloadLimitBytes: videoAutoDownloadLimitBytes,
   );
 
   final day1 = DateTime.utc(2026, 10, 1);
@@ -403,17 +405,128 @@ void main() {
     });
   });
 
+  group('video threshold and placeholders', () {
+    // `Sub/b.mp4` is 3 bytes; a threshold of 2 puts it above, the default puts it below
+    const above = 2;
+
+    test('a video above the threshold gets a placeholder row, no download, and the subtree is still promised', () async {
+      final server = serverWith();
+      final account = accountWith(videoAutoDownloadLimitBytes: above);
+      final result = await sync(useCaseWith(server), account: account);
+
+      expect(server.downloads, ['Sub/Deep/c.jpg', 'a.jpg'], reason: 'the video is not fetched');
+      expect(sink.placeholders, ['Sub/b.mp4']);
+      final row = mirror.rows(account)['Sub/b.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.placeholder);
+      expect(row.localSizeBytes, 0);
+      expect(row.remoteSizeBytes, 3);
+      expect(await File(mirror.localPathFor(account, 'Sub/b.mp4')).exists(), isFalse);
+      expect(result.added, 3);
+      // the completeness rule admits a placeholder, so the etags are earned despite the missing file
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v1'));
+    });
+
+    test('a placeholder row is current on the next run and is not dropped as lost', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      final account = accountWith(videoAutoDownloadLimitBytes: above);
+      await sync(useCase, account: account);
+
+      // re-enumerate the video's folder (`Deep` stays trusted) so the currency check actually runs on it
+      server.collections[''] = 'root-v2';
+      server.collections['Sub'] = 'sub-v2';
+      final second = await sync(useCase, account: account);
+      expect(second.lost, 0, reason: 'a row with no file is a cache miss, except a placeholder');
+      expect(second.skipped, 2, reason: 'a.jpg and the placeholder video are both current');
+      expect(sink.placeholders.length, 1, reason: 'not put again');
+      expect(server.downloads.length, 2);
+      expect(mirror.rows(account)['Sub/b.mp4']?.tier, NextcloudMirrorTier.placeholder);
+    });
+
+    test('a video already held as an original is not downgraded when the threshold drops below it', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase, account: accountWith());
+      expect(mirror.rows(accountWith())['Sub/b.mp4']?.tier, NextcloudMirrorTier.original);
+
+      // every row migrated from v1 is exactly this shape: original, not pinned, possibly above the threshold
+      server.collections[''] = 'root-v2';
+      server.collections['Sub'] = 'sub-v2';
+      final lowered = await sync(useCase, account: accountWith(videoAutoDownloadLimitBytes: above));
+      expect(sink.placeholders, isEmpty);
+      expect(lowered.skipped, 2, reason: 'an original answers for a placeholder, so the video is current');
+      expect(server.downloads.length, 3, reason: 'nothing re-fetched');
+      final row = mirror.rows(accountWith())['Sub/b.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.localSizeBytes, 3);
+    });
+
+    test('raising the threshold lists everything again and promotes the placeholder to an original', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase, account: accountWith(videoAutoDownloadLimitBytes: above));
+      expect(states.states['acc1']?.collectionEtags, isNotEmpty);
+      expect(server.enumerations, 1);
+
+      // the promised subtrees would skip the video forever: a raised threshold has to relist, like a raised
+      // cache limit does
+      final raised = await sync(useCase, account: accountWith());
+      expect(server.enumerations, 2, reason: 'the stored etags must not be trusted after the threshold rose');
+      expect(server.downloads, contains('Sub/b.mp4'));
+      expect(raised.updated, 1);
+      final row = mirror.rows(accountWith())['Sub/b.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.localSizeBytes, 3);
+    });
+
+    test('a placeholder the sink refuses leaves no row and withholds the etags', () async {
+      sink.putFails.add('Sub/b.mp4');
+      final server = serverWith();
+      final account = accountWith(videoAutoDownloadLimitBytes: above);
+      final result = await sync(useCaseWith(server), account: account);
+
+      expect(mirror.rows(account).containsKey('Sub/b.mp4'), isFalse, reason: 'a row with no entry would be skipped by etag forever');
+      expect(result.itemFailures.keys, ['Sub/b.mp4']);
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
+    });
+
+    test('a promotion the budget cannot fund keeps the placeholder and withholds the subtree', () async {
+      final server = serverWith(files: [fakeFile('Sub/b.mp4', size: 5, modified: day2, fileId: 2)]);
+      final useCase = useCaseWith(server);
+      await sync(useCase, account: accountWith(cacheLimitBytes: 4, videoAutoDownloadLimitBytes: above));
+      expect(states.states['acc1']?.collectionEtags, isNotEmpty);
+
+      final raised = await sync(useCase, account: accountWith(cacheLimitBytes: 4, videoAutoDownloadLimitBytes: 10));
+      expect(raised.itemFailures['Sub/b.mp4'], isA<NextcloudQuotaFailure>());
+      expect(mirror.rows(accountWith())['Sub/b.mp4']?.tier, NextcloudMirrorTier.placeholder, reason: 'a failed promotion keeps what was there');
+      // the row is below the tier this run wanted, so the subtree is a gap and must not be promised
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
+    });
+  });
+
   group('FileNextcloudSyncStateStore', () {
     test('round trips, survives a corrupt file, and clears', () async {
       final store = FileNextcloudSyncStateStore(tempDir.path);
       final account = accountWith();
       expect((await store.load(account)).collectionEtags, isEmpty);
 
-      await store.save(account, const NextcloudSyncState(collectionEtags: {'': 'r1', 'Sub': 's1'}, cacheLimitBytes: 42));
+      await store.save(account, const NextcloudSyncState(collectionEtags: {'': 'r1', 'Sub': 's1'}, cacheLimitBytes: 42, videoAutoDownloadLimitBytes: 7));
       final loaded = await store.load(account);
       expect(loaded.collectionEtags, {'': 'r1', 'Sub': 's1'});
       expect(loaded.cacheLimitBytes, 42);
+      expect(loaded.videoAutoDownloadLimitBytes, 7);
       expect(await File('${tempDir.path}/acc1.sync.json.part').exists(), isFalse);
+
+      // a state written before the threshold existed reads as 0, so any configured limit counts as raised
+      await File('${tempDir.path}/acc1.sync.json').writeAsString('{"collectionEtags": {"": "r1"}, "cacheLimitBytes": 42}');
+      expect((await store.load(account)).videoAutoDownloadLimitBytes, 0);
+
+      // a wrong type is as recoverable as a missing key; a throwing cast would fail every later sync
+      await File('${tempDir.path}/acc1.sync.json').writeAsString('{"collectionEtags": {"": "r1"}, "cacheLimitBytes": "42", "videoAutoDownloadLimitBytes": null}');
+      final tolerant = await store.load(account);
+      expect(tolerant.cacheLimitBytes, 0);
+      expect(tolerant.videoAutoDownloadLimitBytes, 0);
+      expect(tolerant.collectionEtags, {'': 'r1'});
 
       await File('${tempDir.path}/acc1.sync.json').writeAsString('{not json');
       expect((await store.load(account)).collectionEtags, isEmpty);

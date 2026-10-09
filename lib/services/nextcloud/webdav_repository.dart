@@ -348,8 +348,9 @@ class WebDavNextcloudRepository implements NextcloudRepository {
   @override
   Future<Uint8List> fetchPoster(NextcloudRemoteItem item, {required int width, required int height}) async {
     // No poster without device-side frame extraction: this server answers 404 on `/core/preview` for every
-    // video. Declared here so the sync can be written against the port; the implementation belongs to the
-    // leaf that adds the `setDataSource(url, headers)` path on the Android side.
+    // video. Nothing calls this in the first cut, and the device poster path does not go through it: a
+    // video not held as an original is a `placeholder` row whose tile is rendered by the native video
+    // thumbnail path. It goes live only if the wire measurement forces poster rows into the mirror.
     throw NextcloudPreviewUnavailableFailure(item.relativePath);
   }
 

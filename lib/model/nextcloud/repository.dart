@@ -98,10 +98,14 @@ abstract class NextcloudRepository {
   // Poster frame of a video, sized like `fetchPreview`, for a grid tile.
   //
   // Separate from `fetchPreview` because no Nextcloud server reached so far can produce one: the preview
-  // endpoint answers 404 for every video unless `OC\Preview\Movie` is enabled with ffmpeg. So the frame
-  // has to be extracted on the device from the remote file, which is why this is a port and not a helper —
-  // the sync can put a poster row for a video without knowing how the frame is obtained, and a caller that
-  // cannot obtain one throws `NextcloudPreviewUnavailableFailure` and gets a `placeholder` row in answer.
+  // endpoint answers 404 for every video unless `OC\Preview\Movie` is enabled with ffmpeg.
+  //
+  // Nothing calls this in the first cut. A video the mirror does not hold as an original gets a
+  // `placeholder` row, and its poster comes from the device's own video thumbnail path against the remote
+  // URL with headers, held by the image cache rather than the mirror. This port goes live only if the
+  // measured wire cost of that path forces poster rows into the mirror, and the on-disk layout of such a
+  // row goes into the contract before that happens. A caller that cannot obtain a frame throws
+  // `NextcloudPreviewUnavailableFailure` and gets a `placeholder` row in answer.
   //
   // Implementations must not download the whole file to do this. An MP4 written by a phone is not
   // faststart (`ftyp` + `free` + `mdat`, with `moov` at the tail: measured at 147,691 bytes on a 1.91 GB

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:aves/model/nextcloud/account.dart';
+import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 
 // Ports of the sync use case towards the app; the integration phase implements them.
@@ -14,7 +15,13 @@ abstract class NextcloudSyncSink {
   // (`origin = EntryOrigins.nextcloud`). Returns false when the file could not be turned into an entry;
   // the sync then drops the mirror file again, so a file that is mirrored but invisible never survives
   // into the next run (its etag would match and it would be skipped forever).
-  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath);
+  //
+  // `tier` says what the bytes at `localPath` are. It matters to the entry and not only to the index:
+  // below `NextcloudMirrorTier.original` the bytes carry no Exif at all, so date and location have to come
+  // from `item.photoMetadata`, and the dimensions have to come from the bytes themselves rather than from
+  // `photoMetadata.width/height` — the server reports those **un-rotated** while a preview has the
+  // rotation burned in, so a portrait photo would otherwise be recorded as landscape.
+  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier);
 
   // Removes the entries of mirrored files that are gone (removed on the server, evicted, or missing).
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths);
@@ -22,6 +29,21 @@ abstract class NextcloudSyncSink {
 
 // What a run knows about the previous one: the collection etags that were fully enumerated, and the cache
 // limit they were enumerated under (a raised limit re-lists everything, so evicted files can come back).
+//
+// A persisted etag promises that the mirror holds every file under that subtree, which only a run that
+// actually mirrored them can make. Now that a row can hold less than the whole file, "mirrored" has to name
+// a tier, and the rule is:
+//
+// - an image is satisfied by a row at `NextcloudMirrorTier.grid` or later, with its bytes on disk,
+// - a video is satisfied by its poster row, equally at `grid` or later,
+// - a video above `NextcloudAccount.videoAutoDownloadLimitBytes`, or one whose poster the server and the
+//   device both failed to produce, is satisfied by a `placeholder` row, which has no bytes by design,
+// - the `view` and `original` tiers never enter the rule. They are fetched on demand, so requiring them
+//   would mean no root etag is ever published again.
+//
+// The tier ordering is what makes this survivable in both directions: a row that holds an explicitly
+// downloaded original satisfies a grid requirement, so an upgrade from a tier-less index (where every row
+// is an original) does not look like a mirror full of holes.
 class NextcloudSyncState {
   final Map<String, String> collectionEtags;
   final int cacheLimitBytes;

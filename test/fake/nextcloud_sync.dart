@@ -169,6 +169,9 @@ class FakeNextcloudRepository implements NextcloudRepository {
   Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height}) => throw UnimplementedError();
 
   @override
+  Future<Uint8List> fetchPoster(NextcloudRemoteItem item, {required int width, required int height}) => throw UnimplementedError();
+
+  @override
   void dispose() => disposed = true;
 }
 
@@ -241,7 +244,10 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       relativePath: entry.relativePath,
       etag: entry.etag,
       fileId: entry.fileId,
-      sizeBytes: stat.size,
+      tier: entry.tier,
+      remoteSizeBytes: entry.remoteSizeBytes,
+      localSizeBytes: stat.size,
+      pinned: entry.pinned,
       remoteLastModified: entry.remoteLastModified,
       downloadedAt: entry.downloadedAt,
       lastAccessAt: entry.lastAccessAt,
@@ -262,7 +268,7 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   }
 
   @override
-  Future<int> usedBytes(NextcloudAccount account) async => rows(account).values.fold<int>(0, (sum, v) => sum + v.sizeBytes);
+  Future<int> usedBytes(NextcloudAccount account) async => rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
 
   @override
   Future<Set<String>> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
@@ -270,7 +276,8 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
     final target = (account.cacheLimitBytes - reserveBytes).clamp(0, account.cacheLimitBytes);
     final evicted = <String>{};
     var used = await usedBytes(account);
-    final candidates = rows(account).values.toList()
+    // mirrors the real store: a pinned row is never a candidate
+    final candidates = rows(account).values.where((v) => !v.pinned).toList()
       ..sort((a, b) {
         final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
         return byAccess != 0 ? byAccess : a.relativePath.compareTo(b.relativePath);
@@ -279,7 +286,7 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       if (used <= target) break;
       await remove(account, victim.relativePath);
       evicted.add(victim.relativePath);
-      used -= victim.sizeBytes;
+      used -= victim.localSizeBytes;
     }
     return evicted;
   }
@@ -297,13 +304,17 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
   final List<Set<String>> removals = [];
   final Set<String> putFails = {};
 
+  // tier each put was made at, so a test can assert what the sync claimed the bytes were
+  final Map<String, NextcloudMirrorTier> putTiers = {};
+
   Set<String> get removed => removals.expand((v) => v).toSet();
 
   @override
-  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath) async {
+  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier) async {
     if (putFails.contains(item.relativePath)) return false;
     if (!await File(localPath).exists()) throw StateError('put before the file was written: $localPath');
     puts.add(item.relativePath);
+    putTiers[item.relativePath] = tier;
     return true;
   }
 

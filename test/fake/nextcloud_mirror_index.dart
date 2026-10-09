@@ -30,7 +30,8 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   @override
   Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
     getLeastRecentlyAccessedCalls++;
-    final entries = _rows(account).values.toList();
+    // same exclusion as the sqflite index: a pinned row can never be evicted, so it is not a candidate
+    final entries = _rows(account).values.where((v) => !v.pinned).toList();
     // same total order as the sqflite index: `lastAccessAt`, then `relativePath` to break ties
     entries.sort((a, b) {
       final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
@@ -52,5 +53,5 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   Future<void> deleteAll(NextcloudAccount account) async => _rows(account).clear();
 
   @override
-  Future<int> sumSizeBytes(NextcloudAccount account) async => _rows(account).values.fold<int>(0, (sum, v) => sum + v.sizeBytes);
+  Future<int> sumLocalSizeBytes(NextcloudAccount account) async => _rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
 }

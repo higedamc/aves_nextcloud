@@ -17,6 +17,9 @@ abstract class NextcloudMirrorIndex {
 
   // Least-recently-accessed first, at most `limit` rows. Eviction pages through this instead of
   // loading the whole account: a large library can hold a six-figure number of rows.
+  //
+  // Pinned rows are excluded, because they can never be evicted: handing them back would give the store a
+  // page of candidates that cannot go, which it reads as "the account has nothing left to evict".
   Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit});
 
   // Inserts or replaces the row for `entry.relativePath`.
@@ -27,6 +30,8 @@ abstract class NextcloudMirrorIndex {
 
   Future<void> deleteAll(NextcloudAccount account);
 
-  // Sum of `sizeBytes` over the account's rows.
-  Future<int> sumSizeBytes(NextcloudAccount account);
+  // Sum of `localSizeBytes` over the account's rows: bytes on disk, never remote sizes. Named for the
+  // column it sums, because summing `remoteSizeBytes` instead would report a mirror of preview rows as
+  // the size of the whole remote library and evict everything forever.
+  Future<int> sumLocalSizeBytes(NextcloudAccount account);
 }

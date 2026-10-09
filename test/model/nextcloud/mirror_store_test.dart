@@ -28,12 +28,17 @@ void main() {
   NextcloudMirrorIndexEntry entryFor(
     String relativePath, {
     int sizeBytes = 0,
+    NextcloudMirrorTier tier = NextcloudMirrorTier.original,
+    bool pinned = false,
     DateTime? lastAccessAt,
   }) => NextcloudMirrorIndexEntry(
     relativePath: relativePath,
     etag: '"etag-$relativePath"',
     fileId: 42,
-    sizeBytes: sizeBytes,
+    tier: tier,
+    remoteSizeBytes: sizeBytes,
+    localSizeBytes: sizeBytes,
+    pinned: pinned,
     remoteLastModified: epoch,
     downloadedAt: epoch,
     lastAccessAt: lastAccessAt ?? epoch,
@@ -143,7 +148,7 @@ void main() {
       // a caller reporting the wrong size must not be able to corrupt the accounting
       await store.record(account, entryFor('trip/a.jpg', sizeBytes: 1));
 
-      expect((await store.lookup(account, 'trip/a.jpg'))!.sizeBytes, 120);
+      expect((await store.lookup(account, 'trip/a.jpg'))!.localSizeBytes, 120);
       expect(await store.usedBytes(account), 120);
     });
 

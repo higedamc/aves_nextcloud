@@ -6,6 +6,7 @@ import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/favourites.dart';
 import 'package:aves/model/filters/covered/stored_album.dart';
+import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 import 'package:aves/model/nextcloud/sync_sink_impl.dart';
@@ -167,7 +168,7 @@ void main() {
     sink = NextcloudCollectionSyncSink(source, mirror);
     (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA)};
 
-    expect(await sink.putMirroredFile(account, itemFor(relA), localA), isTrue);
+    expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.original), isTrue);
 
     expect(db.inserts.length, 1);
     final inserted = db.inserts.single.single;
@@ -178,7 +179,7 @@ void main() {
     expect(db.updates, isEmpty);
 
     // the index knows the URI now: the same file again is a refresh, not a second row
-    expect(await sink.putMirroredFile(account, itemFor(relA), localA), isTrue);
+    expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.original), isTrue);
     expect(db.inserts.length, 1);
     expect(db.rows.keys, {inserted.id});
     expect(inCollection(uriA).length, 1);
@@ -191,7 +192,7 @@ void main() {
     sink = NextcloudCollectionSyncSink(source, mirror);
     (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sizeBytes: 99)};
 
-    expect(await sink.putMirroredFile(account, itemFor(relA), localA), isTrue);
+    expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.original), isTrue);
 
     expect(db.inserts, isEmpty);
     expect(db.updates.map((update) => update.$1).toSet(), {1});
@@ -207,7 +208,7 @@ void main() {
     db.rows[7] = row(localA, id: 7);
     (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sizeBytes: 99)};
 
-    expect(await sink.putMirroredFile(account, itemFor(relA), localA), isTrue);
+    expect(await sink.putMirroredFile(account, itemFor(relA), localA, NextcloudMirrorTier.original), isTrue);
 
     expect(db.inserts, isEmpty);
     expect(db.updates.length, 1);

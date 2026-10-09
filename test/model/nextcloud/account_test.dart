@@ -45,4 +45,39 @@ void main() {
     expect(http.isSchemeAllowed, isFalse);
     expect(http.copyWith(allowInsecureHttp: true).isSchemeAllowed, isTrue);
   });
+
+  group('video auto-download threshold', () {
+    test('an account stored before the field existed reads the default, not zero', () {
+      final account = NextcloudAccount.fromJson(json());
+
+      // 0 would mean "no video is ever small enough", which looks like a deliberate setting and would
+      // never be reported as a bug
+      expect(account.videoAutoDownloadLimitBytes, NextcloudAccount.defaultVideoAutoDownloadLimitBytes);
+      expect(account.videoAutoDownloadLimitBytes, 500 * 1024 * 1024);
+    });
+
+    test('a stored value survives a round trip', () {
+      final account = NextcloudAccount.fromJson({...json(), 'videoAutoDownloadLimitBytes': 100 * 1024 * 1024});
+      expect(account.videoAutoDownloadLimitBytes, 100 * 1024 * 1024);
+      expect(NextcloudAccount.fromJson(account.toJson()).videoAutoDownloadLimitBytes, 100 * 1024 * 1024);
+    });
+
+    test('a value outside the offered range is clamped into it', () {
+      const steps = NextcloudAccount.videoAutoDownloadLimitSteps;
+
+      expect(NextcloudAccount.fromJson({...json(), 'videoAutoDownloadLimitBytes': -1}).videoAutoDownloadLimitBytes, steps.first, reason: 'a negative limit fails closed invisibly: no video would ever be fetched again');
+      expect(NextcloudAccount.fromJson({...json(), 'videoAutoDownloadLimitBytes': 0}).videoAutoDownloadLimitBytes, steps.first);
+      expect(NextcloudAccount.fromJson({...json(), 'videoAutoDownloadLimitBytes': 1 << 50}).videoAutoDownloadLimitBytes, steps.last);
+    });
+
+    test('the offered steps cover the specified range and stay ordered', () {
+      const steps = NextcloudAccount.videoAutoDownloadLimitSteps;
+
+      expect(steps, containsAllInOrder([500 * 1024 * 1024, 10 * 1024 * 1024 * 1024]), reason: '500 MB to 10 GB was the specified range');
+      expect(steps.contains(NextcloudAccount.defaultVideoAutoDownloadLimitBytes), isTrue, reason: 'the default must be selectable, or the picker cannot show the current value');
+      for (var i = 1; i < steps.length; i++) {
+        expect(steps[i], greaterThan(steps[i - 1]), reason: 'clamping uses first and last as the bounds, so the list must be ascending');
+      }
+    });
+  });
 }

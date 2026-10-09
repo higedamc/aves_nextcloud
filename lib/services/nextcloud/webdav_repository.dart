@@ -325,12 +325,25 @@ class WebDavNextcloudRepository implements NextcloudRepository {
     if (fileId == null) {
       throw NextcloudNotFoundFailure(item.relativePath);
     }
-    final response = await _send(
-      'GET',
-      _serverUrl('/core/preview', query: {'fileId': '$fileId', 'x': '$width', 'y': '$height', 'a': '1'}),
-      relativePath: item.relativePath,
-    );
-    return response.bodyBytes;
+    try {
+      final response = await _send(
+        'GET',
+        _serverUrl('/core/preview', query: {'fileId': '$fileId', 'x': '$width', 'y': '$height', 'a': '1'}),
+        relativePath: item.relativePath,
+      );
+      return response.bodyBytes;
+    } on NextcloudNotFoundFailure {
+      // the endpoint answers 404 for an item it cannot render, which is not the item being gone
+      throw NextcloudPreviewUnavailableFailure(item.relativePath);
+    }
+  }
+
+  @override
+  Future<Uint8List> fetchPoster(NextcloudRemoteItem item, {required int width, required int height}) async {
+    // No poster without device-side frame extraction: this server answers 404 on `/core/preview` for every
+    // video. Declared here so the sync can be written against the port; the implementation belongs to the
+    // leaf that adds the `setDataSource(url, headers)` path on the Android side.
+    throw NextcloudPreviewUnavailableFailure(item.relativePath);
   }
 
   @override

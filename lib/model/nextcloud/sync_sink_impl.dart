@@ -81,7 +81,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   String _uriFor(NextcloudAccount account, String relativePath) => Uri.file(_mirror.localPathFor(account, relativePath)).toString();
 
   @override
-  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath) async {
+  Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier) async {
     final uri = Uri.file(localPath).toString();
     final fetched = await mediaFetchService.getEntry(uri, null, allowUnsized: true);
     if (fetched == null) return false;

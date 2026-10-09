@@ -79,9 +79,36 @@ abstract class NextcloudRepository {
     NextcloudCancellation? cancellation,
   });
 
-  // Server-generated preview (`GET /core/preview?fileId=…&x=…&y=…&a=1`). Not used by v1 (which mirrors originals);
-  // reserved for the later Glide-model path that lets the grid work without originals.
+  // Server-generated preview of an image (`GET /core/preview?fileId=…&x=…&y=…&a=1`).
+  //
+  // Measured against Nextcloud 32.0.11, and binding on any implementation because callers size their
+  // caches from it:
+  // - the request is rounded **up** to a bucket and never upscaled past the original. The long-edge ladder
+  //   observed is 64 / 256 / 341 / 1024 / 2048, so `width`/`height` are an upper bound and not a promise:
+  //   a request for 512 is answered with the 1024 bucket, and a request for 320 with 256x341.
+  // - `a=1` is mandatory. Without it the server crops to a square (`x=y=512` answered 1024x1024).
+  // - the Exif orientation is **burned into the pixels** and the response carries no Exif at all, so the
+  //   bytes display the right way up and carry no date, camera, lens or GPS. Those have to come from
+  //   `NextcloudRemoteItem.photoMetadata`, which makes that field load-bearing rather than a hint.
+  // - a 404 means "no preview for this item", not "no such item", and must be thrown as
+  //   `NextcloudPreviewUnavailableFailure`. Every video on a server without ffmpeg answers 404 here while
+  //   `nc:has-preview` still reports true.
   Future<Uint8List> fetchPreview(NextcloudRemoteItem item, {required int width, required int height});
+
+  // Poster frame of a video, sized like `fetchPreview`, for a grid tile.
+  //
+  // Separate from `fetchPreview` because no Nextcloud server reached so far can produce one: the preview
+  // endpoint answers 404 for every video unless `OC\Preview\Movie` is enabled with ffmpeg. So the frame
+  // has to be extracted on the device from the remote file, which is why this is a port and not a helper —
+  // the sync can put a poster row for a video without knowing how the frame is obtained, and a caller that
+  // cannot obtain one throws `NextcloudPreviewUnavailableFailure` and gets a `placeholder` row in answer.
+  //
+  // Implementations must not download the whole file to do this. An MP4 written by a phone is not
+  // faststart (`ftyp` + `free` + `mdat`, with `moov` at the tail: measured at 147,691 bytes on a 1.91 GB
+  // file), and the server supports `Range` (206), so the index and one keyframe are all that is needed.
+  // Note that an extractor reading the file as a stream will fetch more than that through its read-ahead
+  // cache; the cost has to be measured on the wire rather than assumed from the index size.
+  Future<Uint8List> fetchPoster(NextcloudRemoteItem item, {required int width, required int height});
 
   // Releases connections. The instance must not be used afterwards.
   void dispose();

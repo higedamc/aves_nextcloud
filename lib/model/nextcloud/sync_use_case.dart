@@ -20,11 +20,16 @@ import 'package:aves/model/nextcloud/sync_ports.dart';
 // - The index is accounting, the filesystem is the truth: a row whose file is missing is a cache miss. It is
 //   re-downloaded when the listing emits it and dropped (row and entry) otherwise.
 // - A path reported through `onItemFailure` was not enumerated. Nothing under it is treated as removed.
-// - Collection etags are persisted only after a run that ends without a fatal failure, merged over the
-//   previous map; `force` and a raised cache limit list everything again. Merging (and the unchanged-root
-//   fast path) rests on Nextcloud propagating every etag change to all ancestors: a persisted etag means
-//   "this subtree was fully enumerated when it had this etag", which only stays true because any later
-//   change under it bumps it. Against a WebDAV server that does not propagate, this is silently stale.
+// - A persisted collection etag means "the mirror holds every file under this subtree as of this etag". A
+//   listing alone cannot make that promise: the budget, a failed download, a sink refusal or an eviction all
+//   end the run normally while leaving a listed file without a current row and bytes. So new etags are added
+//   only when every listed item ended the run mirrored (derived from the store after eviction, not from the
+//   failure sites), and the whole map is forgotten when the run evicted or lost anything, because a local
+//   removal under a subtree skipped on an old etag is invisible to every server etag. Nothing is persisted
+//   after a fatal failure; `force` and a raised cache limit list everything again. Merging (and the
+//   unchanged-root fast path) rests on Nextcloud propagating every etag change to all ancestors: the promise
+//   only stays true because any later change under it bumps it. Against a WebDAV server that does not
+//   propagate, this is silently stale.
 // - Downloads go newest first, within the cache budget. When making room would evict a file downloaded in
 //   this run, the remaining (older) files are counted as skipped rather than thrashing the cache.
 class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
@@ -124,21 +129,29 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           }
         }
 
-        await _download(repository, account, downloads, rows, cancellation, stats, emit);
+        final fetched = await _download(repository, account, downloads, rows, cancellation, stats, emit);
         await _drop(account, removed, stats, countAsRemoved: true);
         await _drop(account, lost, stats, countAsRemoved: false);
 
         emit(const NextcloudSyncProgress(phase: NextcloudSyncPhase.evicting));
         await _evict(account, stats);
 
-        // the etags are a promise that the mirror reflects those subtrees; only a completed run can make it
-        await _states.save(
-          account,
-          NextcloudSyncState(
-            collectionEtags: {...state.collectionEtags, ...listing.published},
-            cacheLimitBytes: account.cacheLimitBytes,
-          ),
-        );
+        // The etags are a promise that the mirror reflects those subtrees. Read after `_evict`, since both the
+        // download loop and the final sweep evict.
+        final Map<String, String> etags;
+        if (stats.evicted > 0 || stats.lost > 0) {
+          // a file left the mirror without the server knowing: it may sit under a subtree this run skipped on
+          // an old etag, and no server etag will ever point at it again, so everything is listed next time
+          etags = const {};
+        } else if (await _mirrorReflects(account, listing.items.values, fetched)) {
+          // `known` rather than the stored map: a relisting run must not resurrect etags it was told to ignore
+          etags = {...known, ...listing.published};
+        } else {
+          // the listing completed but the mirror did not (budget, a failed download, a refused entry): nothing
+          // new is promised, and the subtrees this run trusted and never touched stay as they were
+          etags = known;
+        }
+        await _states.save(account, NextcloudSyncState(collectionEtags: etags, cacheLimitBytes: account.cacheLimitBytes));
         emit(const NextcloudSyncProgress(phase: NextcloudSyncPhase.done));
         return stats.result();
       } finally {
@@ -169,7 +182,23 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     return listing;
   }
 
-  Future<void> _download(
+  // Whether every listed item ended the run with a row, bytes on disk and the listed etag (or the etag the
+  // bytes were observed with, when fetched in this run). Derived from the store so that it holds whatever
+  // ended the run short, rather than enumerating the ways it can; stops at the first gap.
+  Future<bool> _mirrorReflects(NextcloudAccount account, Iterable<NextcloudRemoteItem> items, Set<String> fetched) async {
+    final rows = {for (final row in await _mirror.listAll(account)) row.relativePath: row};
+    for (final item in items) {
+      final path = item.relativePath;
+      final row = rows[path];
+      if (row == null) return false;
+      if (row.etag != item.etag && !fetched.contains(path)) return false;
+      if (!await File(_mirror.localPathFor(account, path)).exists()) return false;
+    }
+    return true;
+  }
+
+  // returns the paths fetched in this run
+  Future<Set<String>> _download(
     NextcloudRepository repository,
     NextcloudAccount account,
     List<NextcloudRemoteItem> downloads,
@@ -263,6 +292,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       done++;
       emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
     }
+    return fetchedThisRun;
   }
 
   Future<void> _drop(NextcloudAccount account, Set<String> paths, _Stats stats, {required bool countAsRemoved}) async {

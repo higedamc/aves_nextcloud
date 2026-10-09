@@ -208,6 +208,7 @@ void main() {
       expect(result.itemFailures.keys, ['Sub/b.mp4']);
       expect(result.itemFailures['Sub/b.mp4'], isA<NextcloudNotFoundFailure>());
       expect(mirror.rows(accountWith()).containsKey('Sub/b.mp4'), isFalse);
+      expect(states.states['acc1']?.collectionEtags, isEmpty, reason: 'the listing was complete, the mirror was not');
     });
 
     test('a file the sink cannot turn into an entry is dropped from the mirror so it is retried next time', () async {
@@ -217,9 +218,10 @@ void main() {
       expect(result.itemFailures.keys, ['a.jpg']);
       expect(mirror.rows(accountWith()).containsKey('a.jpg'), isFalse);
       expect(await File(mirror.localPathFor(accountWith(), 'a.jpg')).exists(), isFalse);
-      // the root is complete as far as the listing is concerned: next run re-lists only if the etag changed,
-      // which is why the bytes had to go
+      // no etag is promised, so the next run lists again; the bytes still had to go, or that listing would
+      // find a current row with a file and skip the entry-less file forever
       expect(result.added, 2);
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
     });
 
     test('a network failure during download is fatal and persists no etags', () async {
@@ -259,6 +261,15 @@ void main() {
       expect(result.lost, 1);
       expect(result.evicted, 0);
       expect(result.removed, 0);
+      // the loss sits under `Sub`, skipped on an etag the server will never bump for it: forget the map
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
+
+      // so the following run lists everything and refills the file, with the server still unchanged
+      final refill = await sync(useCase);
+      expect(server.downloads.where((v) => v == 'Sub/b.mp4').length, 2);
+      expect(await File(mirror.localPathFor(accountWith(), 'Sub/b.mp4')).exists(), isTrue);
+      expect(refill.added, 1);
+      expect(states.states['acc1']?.collectionEtags, {'': 'root-v1', 'Sub': 'sub-v1', 'Sub/Deep': 'deep-v1'});
     });
 
     test('part files left by a dead download are swept before listing', () async {
@@ -279,6 +290,24 @@ void main() {
       expect(result.skipped, 1);
       expect(result.evicted, 0);
       expect(mirror.rows(accountWith()).keys, {'Sub/Deep/c.jpg', 'Sub/b.mp4'});
+      expect(states.states['acc1']?.collectionEtags, isEmpty, reason: 'a listed file was not mirrored, so no subtree is promised');
+    });
+
+    test('after a run cut short by the budget, the next run enumerates the whole scope again even though nothing changed', () async {
+      // SEARCH mode: the only etag the listing can earn is the root's, which would skip the entire tree
+      final server = serverWith(supportsSearch: true);
+      final useCase = useCaseWith(server);
+      final first = await sync(useCase, account: accountWith(cacheLimitBytes: 6));
+      expect(first.added, 2);
+      expect(first.skipped, 1);
+
+      final second = await sync(useCase, account: accountWith(cacheLimitBytes: 6));
+      expect(server.enumerations, 2, reason: 'the root etag must not have been published by the truncated run');
+      expect(server.knownEtagsReceived.last, isEmpty);
+      // the file left over is fetched by evicting one of the previous run's (the budget starts empty each
+      // run), which is an eviction: the map stays empty either way
+      expect(second.added + second.evicted, greaterThan(0));
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
     });
 
     test('evicts older files from previous runs to make room, dropping their entries in the same step', () async {
@@ -296,6 +325,8 @@ void main() {
       expect(result.evicted, 1);
       expect(sink.removed, {'old.jpg'});
       expect(mirror.rows(accountWith()).keys, {'new1.jpg', 'new2.jpg'});
+      // an eviction is a local removal no server etag can see: the whole map goes, not only this run's etags
+      expect(states.states['acc1']?.collectionEtags, isEmpty);
     });
 
     test('a file larger than the whole budget is a quota failure and does not empty the mirror', () async {
@@ -318,8 +349,9 @@ void main() {
       final server = serverWith(supportsSearch: true);
       final useCase = useCaseWith(server);
       await sync(useCase);
-      expect(states.states['acc1']?.collectionEtags, isEmpty);
+      expect(states.states['acc1']?.collectionEtags, {'': 'root-v1'}, reason: 'one query covered the scope, so the root alone is earned');
 
+      server.collections[''] = 'root-v2';
       server.files.remove('a.jpg');
       server.failing['Sub/b.mp4'] = const NextcloudParseFailure('no successful propstat');
       final result = await sync(useCase);
@@ -327,6 +359,19 @@ void main() {
       expect(sink.removed, {'a.jpg'});
       expect(mirror.rows(accountWith()).keys, {'Sub/b.mp4', 'Sub/Deep/c.jpg'});
       expect(result.itemFailures.keys, ['Sub/b.mp4']);
+      expect(states.states['acc1']?.collectionEtags, {'': 'root-v1'}, reason: 'an incomplete search promises nothing new');
+    });
+
+    test('an unchanged root is not searched again', () async {
+      final server = serverWith(supportsSearch: true);
+      final useCase = useCaseWith(server);
+      await sync(useCase);
+
+      final result = await sync(useCase);
+      expect(server.enumerations, 1);
+      expect(result.added + result.updated + result.removed + result.lost, 0);
+      expect(mirror.rows(accountWith()).keys, containsAll(['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']));
+      expect(states.states['acc1']?.collectionEtags, {'': 'root-v1'});
     });
   });
 

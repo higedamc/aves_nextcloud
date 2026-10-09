@@ -113,7 +113,14 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     // stored URIs, the mirror URI would miss, and the next real fetch would create the second entry the
     // comment above says it prevents. Making the sink the only authority on where the entry claims to live
     // means a builder cannot get this wrong, and Leaf C never needs to know the mirror layout.
-    return _putEntry(uri, synthesised.copyWith(uri: uri, path: localPath));
+    //
+    // There are no bytes behind a placeholder at all, so unlike the preview tier above, the server's
+    // metadata is not merely the best source, it is the only one. An all-null `CatalogMetadata` still sets
+    // `isCatalogued`, which is correct here rather than regrettable: an entry with no file has nothing for
+    // the device cataloguer to do, and promotion recovers everything once an `original` put arrives with
+    // `presetCatalog: null` and takes the forced-catalog branch.
+    final presetCatalog = catalogMetadataFromPhotoMetadata(synthesised.id, item.photoMetadata);
+    return _putEntry(uri, synthesised.copyWith(uri: uri, path: localPath), presetCatalog: presetCatalog);
   }
 
   // insert-or-refresh for one URI, shared by both puts: everything below is about reconciling the DB row,

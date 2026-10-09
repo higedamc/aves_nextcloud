@@ -495,6 +495,38 @@ void main() {
     expect(preview.url.queryParameters, {'fileId': '1', 'x': '256', 'y': '256', 'a': '1'});
   });
 
+  test('fetchPreview treats a missing file id as no preview, not a missing item', () async {
+    // Nextcloud reports a property it cannot give in a 404 propstat, so the parser yields no id. The item is
+    // still there and still listed; only the preview endpoint, addressed by id, has nothing to be asked for.
+    final server = _Server()
+      ..injectedRootResponse =
+          '''
+  <d:response>
+    <d:href>$_davFiles/noid.jpg</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype/>
+        <d:getetag>"noid-v1"</d:getetag>
+        <d:getcontenttype>image/jpeg</d:getcontenttype>
+        <d:getcontentlength>3</d:getcontentlength>
+        <d:getlastmodified>Tue, 06 Oct 2026 10:00:00 GMT</d:getlastmodified>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+    <d:propstat>
+      <d:prop><oc:fileid/></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>''';
+    final repo = _repo(server);
+    final item = (await repo.listCollection('')).firstWhere((v) => v.relativePath == 'noid.jpg');
+    expect(item.fileId, isNull);
+    final before = server.requests.length;
+    await expectLater(repo.fetchPreview(item, width: 256, height: 256), throwsA(isA<NextcloudPreviewUnavailableFailure>()));
+    // nothing to address the request with, so none is sent
+    expect(server.requests.length, before);
+  });
+
   test('maps HTTP statuses to failures', () async {
     Future<NextcloudRepository> withStatus(int status, {String body = ''}) async {
       return WebDavNextcloudRepository(_account, _credentials, client: MockClient((_) async => http.Response(body, status)));

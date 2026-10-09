@@ -10,6 +10,10 @@ import 'package:aves/model/nextcloud/remote_item.dart';
 //
 // A missing date or coordinate is passed through as `null` rather than coerced to `0`, so the app's existing
 // "unknown" paths (`AvesEntry.bestDate`, `hasGps`) show it as unknown instead of a silent, wrong zero.
+//
+// `entryId` is never the id this `CatalogMetadata` ends up persisted under: every call site re-stamps it with
+// `.copyWith(id: ...)` once the real entry id is known, so a caller passing a placeholder value (e.g. an
+// entry that does not exist yet) is not passing anything meaningful.
 CatalogMetadata catalogMetadataFromPhotoMetadata(int entryId, NextcloudPhotoMetadata? photoMetadata) {
   return CatalogMetadata(
     id: entryId,

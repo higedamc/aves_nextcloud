@@ -38,7 +38,9 @@ NextcloudRemoteItem fakeCollection(String relativePath, String etag) => Nextclou
 // The server, declared as a tree: collections by path (always including `''`), files, and paths that fail.
 // `listMediaTree` reproduces the WebDAV repository's callback semantics: unchanged collections are skipped
 // and published, failing paths are reported, and a collection is published post-order only when nothing
-// under it was reported. With `supportsSearch`, every file comes back as one snapshot and nothing is published.
+// under it was reported. Either strategy checks the root first: an unchanged root publishes the root and
+// enumerates nothing. With `supportsSearch`, every file comes back as one snapshot and the root alone is
+// published, and only when nothing was reported.
 class FakeNextcloudRepository implements NextcloudRepository {
   @override
   final NextcloudAccount account;
@@ -56,6 +58,8 @@ class FakeNextcloudRepository implements NextcloudRepository {
   final List<String> listedRoots = [];
   final List<Map<String, String>> knownEtagsReceived = [];
   final List<String> downloads = [];
+  // listings that went past the root check and enumerated the scope
+  int enumerations = 0;
 
   new(this.account, {required Map<String, String> collections, required List<NextcloudRemoteItem> files, Map<String, NextcloudFailure> failing = const {}, this.supportsSearch = false})
     : collections = Map.of(collections),
@@ -88,15 +92,27 @@ class FakeNextcloudRepository implements NextcloudRepository {
     knownEtagsReceived.add(Map.of(knownCollectionEtags));
     if (cancellation?.isCancelled ?? false) throw const NextcloudCancelledFailure();
 
+    final rootFailure = failing[''];
+    if (rootFailure != null) throw rootFailure;
+    final rootCollection = fakeCollection('', collections['']!);
+    if (knownCollectionEtags[''] == collections['']) {
+      onCollection?.call(rootCollection);
+      return;
+    }
+    enumerations++;
+
     if (supportsSearch) {
+      var reported = false;
       for (final file in files.values) {
         final failure = failing[file.relativePath];
         if (failure != null) {
+          reported = true;
           onItemFailure?.call(file.relativePath, failure);
           continue;
         }
         yield file;
       }
+      if (!reported) onCollection?.call(rootCollection);
       return;
     }
 

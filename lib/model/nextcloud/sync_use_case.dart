@@ -90,7 +90,9 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         await _sweepPartFiles(account);
 
         final state = await _states.load(account);
-        final relist = request.force || account.cacheLimitBytes > state.cacheLimitBytes;
+        // A raised limit of either kind can turn a skipped item into a wanted one, and an item under a subtree
+        // trusted by etag is never listed, so neither could ever be promoted without listing everything.
+        final relist = request.force || account.cacheLimitBytes > state.cacheLimitBytes || account.videoAutoDownloadLimitBytes > state.videoAutoDownloadLimitBytes;
         final known = relist ? const <String, String>{} : state.collectionEtags;
 
         emit(const NextcloudSyncProgress(phase: NextcloudSyncPhase.listing));
@@ -98,19 +100,20 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
 
         final rows = {for (final row in await _mirror.listAll(account)) row.relativePath: row};
         final missing = <String>{};
-        for (final path in rows.keys) {
-          // A `placeholder` row has no file by design, so this reads it as a cache miss and the plan below
-          // drops it as `lost`. Teaching both this sweep and `_mirrorReflects` to exempt that tier is the
-          // first thing the leaf that introduces placeholders has to do; until something creates one, no
-          // row can reach here with that tier.
-          if (!await File(_mirror.localPathFor(account, path)).exists()) missing.add(path);
+        for (final row in rows.values) {
+          // a `placeholder` row has no file by design, so its absence is not a cache miss
+          if (row.tier == NextcloudMirrorTier.placeholder) continue;
+          if (!await File(_mirror.localPathFor(account, row.relativePath)).exists()) missing.add(row.relativePath);
         }
 
         // plan: what to fetch (newest first), what is gone
         final downloads = <NextcloudRemoteItem>[];
         for (final item in listing.items.values) {
           final row = rows[item.relativePath];
-          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath);
+          // A row at a later tier than wanted is current (an original answers for a placeholder), so an
+          // already-held video is never downgraded when the threshold drops below its size; a row at an
+          // earlier tier is not, so raising the threshold promotes a placeholder to an original.
+          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath) && row.satisfies(_wantedTier(account, item));
           if (current && !request.force) {
             stats.skipped++;
           } else {
@@ -155,7 +158,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           // new is promised, and the subtrees this run trusted and never touched stay as they were
           etags = known;
         }
-        await _states.save(account, NextcloudSyncState(collectionEtags: etags, cacheLimitBytes: account.cacheLimitBytes));
+        await _states.save(account, NextcloudSyncState(collectionEtags: etags, cacheLimitBytes: account.cacheLimitBytes, videoAutoDownloadLimitBytes: account.videoAutoDownloadLimitBytes));
         emit(const NextcloudSyncProgress(phase: NextcloudSyncPhase.done));
         return stats.result();
       } finally {
@@ -196,9 +199,21 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       final row = rows[path];
       if (row == null) return false;
       if (row.etag != item.etag && !fetched.contains(path)) return false;
+      // a row below the wanted tier (a placeholder video whose threshold was raised, left there by the
+      // budget) is a gap: promising the subtree would skip it on every later run and never promote it
+      if (!row.satisfies(_wantedTier(account, item))) return false;
+      if (row.tier == NextcloudMirrorTier.placeholder) continue;
       if (!await File(_mirror.localPathFor(account, path)).exists()) return false;
     }
     return true;
+  }
+
+  // The tier this run wants for an item. First cut: everything is mirrored as an original except a video
+  // above `videoAutoDownloadLimitBytes`, which gets a `placeholder` row and is streamed on demand instead.
+  // The grid and view tiers for images arrive with the budget work; this is the only place that decides.
+  static NextcloudMirrorTier _wantedTier(NextcloudAccount account, NextcloudRemoteItem item) {
+    if (item.isVideo && item.sizeBytes > account.videoAutoDownloadLimitBytes) return NextcloudMirrorTier.placeholder;
+    return NextcloudMirrorTier.original;
   }
 
   // returns the paths fetched in this run
@@ -224,6 +239,37 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       final path = item.relativePath;
       final existing = rows[path];
       try {
+        if (_wantedTier(account, item) == NextcloudMirrorTier.placeholder) {
+          // no bytes, so no budget, no eviction and no download: the row and the entry are all there is
+          await _mirror.record(
+            account,
+            NextcloudMirrorIndexEntry(
+              relativePath: path,
+              etag: item.etag,
+              fileId: item.fileId,
+              tier: NextcloudMirrorTier.placeholder,
+              remoteSizeBytes: item.sizeBytes,
+              localSizeBytes: 0,
+              remoteLastModified: item.lastModified,
+              downloadedAt: _now(),
+              lastAccessAt: existing?.lastAccessAt ?? _now(),
+            ),
+          );
+          if (!await _sink.putPlaceholder(account, item)) {
+            // a row with no entry would be skipped by etag forever: drop it so the next run retries
+            await _mirror.remove(account, path);
+            throw NextcloudParseFailure('could not create a placeholder entry for $path');
+          }
+          fetchedThisRun.add(path);
+          if (existing == null) {
+            stats.added++;
+          } else {
+            stats.updated++;
+          }
+          done++;
+          emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
+          continue;
+        }
         if (item.sizeBytes > account.cacheLimitBytes) {
           // never empty the whole mirror for a file that cannot fit anyway
           throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes);

@@ -18,7 +18,6 @@ class NextcloudAccountUseCase {
   final NextcloudAccountStore _accounts;
   final NextcloudCredentialStore _credentials;
   final NextcloudMirrorStore _mirror;
-  final NextcloudSyncSink _sink;
   final NextcloudSyncStateStore _states;
 
   // removes every collection entry under the account's mirror, whether or not the index still has a row for it
@@ -28,7 +27,6 @@ class NextcloudAccountUseCase {
     required this._accounts,
     required this._credentials,
     required this._mirror,
-    required this._sink,
     required this._states,
     required this._removeAllEntries,
   });
@@ -58,11 +56,10 @@ class NextcloudAccountUseCase {
   }
 
   Future<void> purge(NextcloudAccount account) async {
-    final rows = await _mirror.listAll(account);
     await _mirror.purge(account);
-    if (rows.isNotEmpty) {
-      await _sink.removeMirroredFiles(account, rows.map((row) => row.relativePath).toSet());
-    }
+    // `_removeAllEntries` removes every collection entry under the account's mirror root, with or without an
+    // index row, which is already a superset of listing the mirror's rows and asking the sink to drop each
+    // one by relative path, so there is nothing left for that narrower call to add here.
     await _removeAllEntries(account);
     await _states.clear(account);
   }

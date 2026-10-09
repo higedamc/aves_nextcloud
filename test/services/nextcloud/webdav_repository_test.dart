@@ -461,6 +461,11 @@ void main() {
       expect(await File(target).readAsBytes(), [1, 2, 3]);
       expect(await File('$target.part').exists(), isFalse);
       expect(progress.last, 3);
+      // the entry's modified date comes from the file, so it must be the server's `getlastmodified` and
+      // not the moment of the fetch; compared at second precision, which is all the header carries
+      final mtime = await File(target).lastModified();
+      expect(mtime.toUtc().millisecondsSinceEpoch ~/ 1000, item.lastModified.toUtc().millisecondsSinceEpoch ~/ 1000, reason: 'mtime must be getlastmodified, not the fetch time');
+      expect(item.lastModified.toUtc(), DateTime.utc(2026, 10, 6, 10));
     } finally {
       await dir.delete(recursive: true);
     }

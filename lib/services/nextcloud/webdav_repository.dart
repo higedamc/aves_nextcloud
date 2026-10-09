@@ -315,6 +315,13 @@ class WebDavNextcloudRepository implements NextcloudRepository {
       }
       throw _asFailure(error);
     }
+    // The entry's modified date is read from the file, so without this the date is the fetch time. v1 only
+    // got away with that because originals carry Exif and the catalogue prefers it; a preview carries none.
+    // Best effort: the bytes are complete and already in place, and a date is not worth turning a finished
+    // download into an orphan file with no index row.
+    try {
+      await target.setLastModified(item.lastModified);
+    } catch (_) {}
     final etag = _header(response.headers, 'etag');
     return etag == null ? null : _unquote(etag);
   }

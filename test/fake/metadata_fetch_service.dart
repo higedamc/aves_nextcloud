@@ -11,4 +11,7 @@ class FakeMetadataFetchService extends Fake implements MetadataFetchService {
 
   @override
   Future<CatalogMetadata?> getCatalogMetadata(AvesEntry entry, {bool background = false}) => SynchronousFuture(_metaMap[entry]);
+
+  @override
+  Future<Map> getAllMetadata(AvesEntry entry) => SynchronousFuture(const {});
 }

@@ -185,9 +185,7 @@ class _AccountTile extends StatelessWidget with FeedbackMixin, _NextcloudAccount
       final accounts = await nextcloud.accounts(source);
       final removed = await accounts.remove(account);
       if (removed) {
-        // deferred past this tile's own removal from the tree, so its `ValueListenableBuilder` has already
-        // called `removeListener` by the time the notifier is disposed
-        WidgetsBinding.instance.addPostFrameCallback((_) => nextcloud.disposeStatus(account.id));
+        nextcloud.forgetStatus(account.id);
       }
       return removed;
     });

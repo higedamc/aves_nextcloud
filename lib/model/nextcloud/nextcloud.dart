@@ -84,13 +84,13 @@ class Nextcloud {
 
   ValueNotifier<NextcloudSyncStatus> _statusNotifier(String accountId) => _statuses.putIfAbsent(accountId, () => ValueNotifier(NextcloudSyncStatus.idle));
 
-  // Drops and disposes a removed account's status notifier. Nothing in the account lifecycle calls this on its
-  // own: `_statuses` is a field of this singleton, not of `NextcloudAccountUseCase`, so the UI that drives a
-  // removal has to call it after the removal succeeds. The caller should defer this past the frame that
-  // unmounts the account's own tile (e.g. `addPostFrameCallback`): that tile's `ValueListenableBuilder` is
-  // still subscribed until its own `State.dispose()` runs, and disposing a notifier out from under a live
-  // listener throws on its next `removeListener`.
-  void disposeStatus(String accountId) => _statuses.remove(accountId)?.dispose();
+  // Drops a removed account's status notifier. Nothing in the account lifecycle calls this on its own:
+  // `_statuses` is a field of this singleton, not of `NextcloudAccountUseCase`, so the UI that drives a removal
+  // has to call it after the removal succeeds. No `dispose()`: `sync()` holds a reference to this exact notifier
+  // for the lifetime of a run, including inside its `catch`, so disposing it while a sync is in flight turns the
+  // next progress or error update into a use-after-dispose. The map entry is the only retainer, so dropping it
+  // is enough for the notifier to be collected once nothing (a running sync, a listener) still holds it.
+  void forgetStatus(String accountId) => _statuses.remove(accountId);
 
   // Runs one sync for `account`. Returns null when a sync for it is already running (the use case would queue it,
   // but a second user tap should not double the work). A `NextcloudFailure` is reported in the result; anything

@@ -447,8 +447,12 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       final reserve = math.max(0, _reserveFor(item, tier) - (existing?.localSizeBytes ?? 0));
       try {
         final bool funded;
-        if (reserve > account.cacheLimitBytes) {
-          // never empty the whole mirror for a file that cannot fit anyway; says nothing about the rest
+        if (_reserveFor(item, tier) > account.cacheLimitBytes) {
+          // Never empty the whole mirror for a file that cannot fit anyway; says nothing about the rest.
+          // The whole reservation, not the netted one: the two numbers answer different questions. Netted,
+          // a grown file whose own row is the only candidate of its own pass would have that row demoted,
+          // pass the funded check against the bytes the pass had just deleted, be downloaded whole, and be
+          // demoted again by the end-of-run sweep — a body fetched only to be thrown away.
           funded = false;
         } else if (free != null) {
           funded = reserve <= free;
@@ -471,10 +475,18 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           if (!funded) free = account.cacheLimitBytes - used;
         }
         if (!funded) {
+          if (existing != null && existing.pinned) {
+            // The user asked for these bytes, so neither the row nor the file may be demoted for a change
+            // the budget cannot fund: the pinned original stays as it is, and the refusal stays loud, as it
+            // was before placeholders existed. The etag is withheld for it, which is the honest outcome.
+            throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: free ?? account.cacheLimitBytes - await _mirror.usedBytes(account));
+          }
           // The budget said no: the item is still listed, so it gets a row and an entry, streamed on
           // demand, and the reason is recorded so a raised budget knows to come back for it. Not a quota
           // failure, which it was: a failure ends the run with no row for a listed item, which withholds
           // the etags and walks the whole tree again next run, for a file the budget still cannot hold.
+          // Over a row that holds bytes (a changed file), this is a demotion: the store gives the bytes
+          // back and the sink is told, see `_recordPlaceholder`.
           await _recordPlaceholder(account, item, existing, stats, reason: NextcloudPlaceholderReason.unfunded);
           fetchedThisRun.add(path);
           done++;
@@ -563,8 +575,16 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
 
   // No bytes, so no budget, no eviction and no download: the row and the entry are all there is. A
   // placeholder the sink refuses is removed again, since a row with no entry would be skipped by etag forever.
+  //
+  // Written over a row that holds bytes — a changed file the budget cannot fund, or an image the server can
+  // no longer derive — the store gives those bytes back (`NextcloudMirrorStore.record`), and the sink is
+  // told the way it is told about an eviction, not asked for a placeholder: the entry exists and its bytes
+  // are gone, which is a demotion, and `putPlaceholder` on an existing entry refreshes it by reading its
+  // file, which with the file gone drops the entry. Counted as `demoted`, not `updated`: nothing was
+  // refreshed, the budget took bytes back.
   Future<void> _recordPlaceholder(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing, _Stats stats, {required NextcloudPlaceholderReason reason}) async {
     final path = item.relativePath;
+    final heldBytes = existing != null && existing.tier != NextcloudMirrorTier.placeholder;
     await _mirror.record(
       account,
       NextcloudMirrorIndexEntry(
@@ -580,13 +600,18 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         lastAccessAt: existing?.lastAccessAt ?? _now(),
       ),
     );
+    if (heldBytes) {
+      await _sink.demoteToPlaceholders(account, {path});
+      stats.demoted++;
+      return;
+    }
     if (!await _sink.putPlaceholder(account, item)) {
       await _mirror.remove(account, path);
       throw NextcloudLocalStorageFailure('could not create a placeholder entry for $path');
     }
     if (existing == null) {
       stats.added++;
-    } else if (existing.etag != item.etag || existing.tier != NextcloudMirrorTier.placeholder || existing.placeholderReason != reason) {
+    } else if (existing.etag != item.etag || existing.placeholderReason != reason) {
       // a relist that finds the budget still says no writes the same row again; that is not an update
       stats.updated++;
     }

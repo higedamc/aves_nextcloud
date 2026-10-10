@@ -463,6 +463,22 @@ void main() {
       expect(await store.lookup(account, 'missing.jpg'), isNull);
     });
 
+    test('a placeholder written over a row that holds bytes deletes them, so the accounting stays honest', () async {
+      final account = accountWith(cacheLimitBytes: 100);
+      await recordWritten(account, 'changed.jpg', 40, tier: NextcloudMirrorTier.grid);
+      expect(await store.usedBytes(account), 40);
+
+      // a changed file the budget cannot fund, or that the server can no longer derive: the row becomes a
+      // placeholder, and the bytes it held must not stay on disk under a row that claims none
+      await store.record(account, entryFor('changed.jpg', sizeBytes: 90, tier: NextcloudMirrorTier.placeholder));
+
+      final row = await store.lookup(account, 'changed.jpg');
+      expect(row!.tier, NextcloudMirrorTier.placeholder);
+      expect(row.localSizeBytes, 0);
+      expect(await File(store.localPathFor(account, 'changed.jpg')).exists(), isFalse, reason: 'the bytes went back to the budget');
+      expect(await store.usedBytes(account), 0);
+    });
+
     test('a placeholder is never a victim and does not stall the rows behind it', () async {
       final account = accountWith(cacheLimitBytes: 100);
       // `aaa` so it sorts ahead of the row with bytes: a placeholder is never viewed, so its `lastAccessAt`

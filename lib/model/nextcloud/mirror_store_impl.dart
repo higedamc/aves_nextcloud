@@ -79,7 +79,12 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry) async {
     final normalized = _requireNormalized(entry.relativePath);
     if (entry.tier == NextcloudMirrorTier.placeholder) {
-      // no bytes by design, so there is nothing to stat and nothing to read back
+      // No bytes by design, and the store is what makes it so: written over a row that holds bytes (a
+      // changed file the budget cannot fund, or that the server can no longer derive), the file goes back
+      // to the budget here. Left on disk under a row that claims zero bytes, it would be counted by nothing
+      // and found by no later run, which is `usedBytes` lying forever by another route. File first, as in
+      // `_demote`: a crash in between leaves a cache miss, not bytes nothing accounts for.
+      await _deleteFile(localPathFor(account, normalized));
       await _index.put(account, entry.copyWith(localSizeBytes: 0));
       return;
     }

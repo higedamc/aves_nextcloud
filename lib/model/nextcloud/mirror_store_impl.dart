@@ -128,57 +128,99 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
   @override
   Future<int> usedBytes(NextcloudAccount account) => _index.sumLocalSizeBytes(account);
 
-  // one page of eviction candidates; removing them brings up the next page in the same order.
+  // one page of eviction candidates; demoting them brings up the next page in the same order, since a
+  // demoted row is a placeholder and no candidate query returns those.
   // A page that is entirely undeletable stops eviction, so this is also the number of consecutive
-  // undeletable rows at the head of the LRU order that can hide the rest of the queue.
+  // undeletable rows at the head of an order that can hide the rest of the queue.
   static const _evictionPageSize = 256;
 
   @override
-  Future<NextcloudEvictionOutcome> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
+  Future<NextcloudEvictionOutcome> evictToFit(
+    NextcloudAccount account, {
+    int reserveBytes = 0,
+    NextcloudEvictionOrder order = NextcloudEvictionOrder.leastRecentlyAccessed,
+    NextcloudSyncFunding? funding,
+  }) async {
     final budget = account.cacheLimitBytes - reserveBytes;
     final target = budget < 0 ? 0 : budget;
 
     var used = await _index.sumLocalSizeBytes(account);
-    final evicted = <String>{};
+    final demoted = <String>{};
 
-    while (used > target) {
-      final victims = await _index.getLeastRecentlyAccessed(account, limit: _evictionPageSize);
-      if (victims.isEmpty) break;
+    for (final page in _candidatePages(account, order, funding)) {
+      while (used > target) {
+        final victims = await page(_evictionPageSize);
+        if (victims.isEmpty) break;
 
-      var removedFromPage = 0;
-      for (final victim in victims) {
-        if (used <= target) break;
-        try {
-          await remove(account, victim.relativePath);
-        } catch (_) {
-          // `remove` deletes the file before the row, so a failure here means either that nothing went,
-          // or that the bytes are already gone and only the row stayed. The second case must still be
-          // reported: the caller drops the collection entry for every path returned here, and an entry
-          // left pointing at a deleted file is exactly the `entry.refresh` trap the contract warns about.
-          if (await _bytesAreGone(account, victim.relativePath)) {
-            evicted.add(victim.relativePath);
+        var demotedFromPage = 0;
+        for (final victim in victims) {
+          if (used <= target) break;
+          try {
+            await _demote(account, victim);
+          } catch (_) {
+            // `_demote` deletes the file before rewriting the row, so a failure here means either that
+            // nothing went, or that the bytes are already gone and the row still claims them. The second
+            // case must still be reported: the caller tells the sink about every path returned here, and
+            // an entry left describing bytes that are not there is exactly what the sink must not keep.
+            if (await _bytesAreGone(account, victim.relativePath)) {
+              demoted.add(victim.relativePath);
+            }
+            // `used` and `demotedFromPage` deliberately stay put, even in that case: the row is still at
+            // the head of its order, so counting this as progress would re-query the same page forever.
+            // Leaving the row also keeps its bytes accounted for, which only ever evicts more than needed.
+            continue;
           }
-          // `used` and `removedFromPage` deliberately stay put, even in that case: the row is still at
-          // the head of the LRU order, so counting this as progress would re-query the same page forever.
-          // Leaving the row also keeps its bytes accounted for, which only ever evicts more than needed.
-          continue;
+          demoted.add(victim.relativePath);
+          used -= victim.localSizeBytes;
+          demotedFromPage++;
         }
-        evicted.add(victim.relativePath);
-        used -= victim.localSizeBytes;
-        removedFromPage++;
+        // nothing on this page could go, so the next page would be the same one
+        if (demotedFromPage == 0) break;
       }
-      // nothing on this page could go, so the next page would be the same one
-      if (removedFromPage == 0) break;
     }
     // `used > target` here means even an empty mirror cannot hold the reservation; the caller decides
-    // whether that is a `NextcloudQuotaFailure`. Everything evicted is reported either way.
-    //
-    // `demoted` is always empty here, and that is the honest state of this implementation rather than an
-    // oversight: nothing fetches the `view` tier yet, so no row has a cheaper tier to fall back to. The
-    // contract carries the outcome now so the leaf that adds the view tier can fill it in without changing
-    // this signature while other leaves are in flight — and so that no caller is written against a return
-    // type that can only say "removed".
-    return NextcloudEvictionOutcome(removed: evicted);
+    // whether that is a `NextcloudQuotaFailure` or an unfunded placeholder. Everything demoted is reported
+    // either way. `removed` is never produced: a victim keeps its row, see the contract.
+    return NextcloudEvictionOutcome(demoted: demoted);
+  }
+
+  // The candidate queries one call takes, in order. Each is paged until it is exhausted or the target is
+  // met, then the next one starts; under the access order there is only one.
+  List<Future<List<NextcloudMirrorIndexEntry>> Function(int limit)> _candidatePages(NextcloudAccount account, NextcloudEvictionOrder order, NextcloudSyncFunding? funding) {
+    switch (order) {
+      case NextcloudEvictionOrder.leastRecentlyAccessed:
+        return [(limit) => _index.getLeastRecentlyAccessed(account, limit: limit)];
+      case NextcloudEvictionOrder.oldestFirst:
+        // Originals go first, as a class, then grid rows: a library of thumbnails beats whole copies of a
+        // few files. `view` rows are derivative bytes the sync does not rank and go with the originals;
+        // the leaf that fetches them decides whether that is where they belong. The bound is the one
+        // `NextcloudSyncFunding` documents: an original may only take originals older than itself, and
+        // never a grid row; a grid row may take any original and only grid rows older than itself.
+        final fundsGrid = funding == null || funding.tier == NextcloudMirrorTier.grid;
+        return [
+          (limit) => _index.getOldestModified(
+            account,
+            limit: limit,
+            tiers: const {NextcloudMirrorTier.original, NextcloudMirrorTier.view},
+            modifiedBefore: fundsGrid ? null : funding.lastModified,
+          ),
+          if (fundsGrid)
+            (limit) => _index.getOldestModified(
+              account,
+              limit: limit,
+              tiers: const {NextcloudMirrorTier.grid},
+              modifiedBefore: funding?.lastModified,
+            ),
+        ];
+    }
+  }
+
+  // The one transition eviction makes: the file goes, the row stays as an unfunded placeholder. File
+  // first, so that a crash in between leaves a row whose file is missing — a cache miss the next sync
+  // reconciles — rather than a placeholder row with bytes on disk that nothing accounts for.
+  Future<void> _demote(NextcloudAccount account, NextcloudMirrorIndexEntry victim) async {
+    await _deleteFile(localPathFor(account, victim.relativePath));
+    await _index.put(account, victim.asUnfundedPlaceholder());
   }
 
   @override
@@ -205,7 +247,7 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     return normalized;
   }
 
-  // after a failed `remove`: are the bytes gone even though the row stayed?
+  // after a failed `remove` or `_demote`: are the bytes gone even though the row stayed as it was?
   Future<bool> _bytesAreGone(NextcloudAccount account, String relativePath) async {
     try {
       return !await File(localPathFor(account, relativePath)).exists();

@@ -31,15 +31,17 @@ void main() {
     NextcloudMirrorTier tier = NextcloudMirrorTier.original,
     bool pinned = false,
     DateTime? lastAccessAt,
+    DateTime? modified,
   }) => NextcloudMirrorIndexEntry(
     relativePath: relativePath,
     etag: '"etag-$relativePath"',
     fileId: 42,
     tier: tier,
+    placeholderReason: tier == NextcloudMirrorTier.placeholder ? NextcloudPlaceholderReason.policy : null,
     remoteSizeBytes: sizeBytes,
     localSizeBytes: sizeBytes,
     pinned: pinned,
-    remoteLastModified: epoch,
+    remoteLastModified: modified ?? epoch,
     downloadedAt: epoch,
     lastAccessAt: lastAccessAt ?? epoch,
   );
@@ -51,9 +53,20 @@ void main() {
     await file.writeAsBytes(List.filled(size, 0));
   }
 
-  Future<void> recordWritten(NextcloudAccount account, String relativePath, int size, {DateTime? lastAccessAt}) async {
+  Future<void> recordWritten(NextcloudAccount account, String relativePath, int size, {DateTime? lastAccessAt, DateTime? modified, NextcloudMirrorTier tier = NextcloudMirrorTier.original, bool pinned = false}) async {
     await writeMirrorFile(account, relativePath, size);
-    await store.record(account, entryFor(relativePath, sizeBytes: size, lastAccessAt: lastAccessAt));
+    await store.record(account, entryFor(relativePath, sizeBytes: size, lastAccessAt: lastAccessAt, modified: modified, tier: tier, pinned: pinned));
+  }
+
+  // what a demoted row must look like: no bytes, the reason recorded, the identity kept
+  Future<void> expectDemoted(NextcloudAccount account, String relativePath, {required int remoteSizeBytes}) async {
+    final row = (await store.lookup(account, relativePath))!;
+    expect(row.tier, NextcloudMirrorTier.placeholder, reason: 'the row survives eviction');
+    expect(row.placeholderReason, NextcloudPlaceholderReason.unfunded, reason: 'the budget took the bytes, so the budget can give them back');
+    expect(row.localSizeBytes, 0);
+    expect(row.remoteSizeBytes, remoteSizeBytes, reason: 'the identity of the file is kept');
+    expect(row.etag, '"etag-$relativePath"');
+    expect(await File(store.localPathFor(account, relativePath)).exists(), isFalse);
   }
 
   setUpAll(() {
@@ -234,7 +247,18 @@ void main() {
 
   // `evictToFit` reports removals and demotions separately; these cases are about removals, and the
   // outcome's own shape is asserted in its own test below.
-  Future<Set<String>> evict(NextcloudAccount account, {int reserveBytes = 0}) async => (await store.evictToFit(account, reserveBytes: reserveBytes)).removed;
+  // eviction never removes a row: everything it reports is a demotion
+  Future<Set<String>> evict(NextcloudAccount account, {int reserveBytes = 0}) async {
+    final outcome = await store.evictToFit(account, reserveBytes: reserveBytes);
+    expect(outcome.removed, isEmpty, reason: 'eviction demotes, it never removes');
+    return outcome.demoted;
+  }
+
+  Future<Set<String>> evictOldestFirst(NextcloudAccount account, {int reserveBytes = 0, NextcloudSyncFunding? funding}) async {
+    final outcome = await store.evictToFit(account, reserveBytes: reserveBytes, order: NextcloudEvictionOrder.oldestFirst, funding: funding);
+    expect(outcome.removed, isEmpty, reason: 'eviction demotes, it never removes');
+    return outcome.demoted;
+  }
 
   group('evictToFit', () {
     test('does nothing while the account is within its limit', () async {
@@ -255,7 +279,7 @@ void main() {
 
       expect(evicted, {'old.jpg'});
       expect(await store.usedBytes(account), 100);
-      expect(await File(store.localPathFor(account, 'old.jpg')).exists(), isFalse);
+      await expectDemoted(account, 'old.jpg', remoteSizeBytes: 50);
       expect(await File(store.localPathFor(account, 'mid.jpg')).exists(), isTrue);
     });
 
@@ -275,12 +299,12 @@ void main() {
       await recordWritten(account, 'a.jpg', 40, lastAccessAt: epoch);
       await recordWritten(account, 'b.jpg', 40, lastAccessAt: epoch.add(const Duration(days: 1)));
 
-      // the caller decides this is a quota failure; the mirror must still not under-report what it deleted
+      // the caller decides what to do about it; the mirror must still not under-report what it took
       final evicted = await evict(account, reserveBytes: 500);
 
       expect(evicted, {'a.jpg', 'b.jpg'});
       expect(await store.usedBytes(account), 0);
-      expect(await store.listAll(account), isEmpty);
+      expect((await store.listAll(account)).map((row) => row.tier), everyElement(NextcloudMirrorTier.placeholder), reason: 'the rows stay');
     });
 
     test('treats a limit of zero as "mirror nothing"', () async {
@@ -302,32 +326,32 @@ void main() {
       expect(await File(store.localPathFor(b, 'b.jpg')).exists(), isTrue);
     });
 
-    test('still reports what it evicted when one row deletion fails', () async {
+    test('still reports what it evicted when one row rewrite fails', () async {
       final account = accountWith(cacheLimitBytes: 0);
       await recordWritten(account, 'stuck.jpg', 10, lastAccessAt: epoch);
       await recordWritten(account, 'ok.jpg', 10, lastAccessAt: epoch.add(const Duration(days: 1)));
-      // the oldest item is the one whose row cannot go, so a propagating failure would hide both
-      index.failDeleteFor.add('stuck.jpg');
+      // the oldest item is the one whose row cannot be rewritten, so a propagating failure would hide both
+      index.failPutFor.add('stuck.jpg');
 
       final evicted = await evict(account);
 
-      // `remove` deletes the file before the row, so `stuck.jpg`'s bytes went even though its row
-      // stayed. It has to be reported: the caller drops its collection entry from this set, and an
-      // entry pointing at a file that is gone is the `entry.refresh` trap.
+      // a demotion deletes the file before rewriting the row, so `stuck.jpg`'s bytes went even though its
+      // row still says `original`. It has to be reported: the caller tells the sink about this set, and an
+      // entry still describing bytes that are gone is exactly what the sink must not keep.
       expect(evicted, {'ok.jpg', 'stuck.jpg'});
       expect(await File(store.localPathFor(account, 'stuck.jpg')).exists(), isFalse);
-      // the row stays, so the bytes stay accounted for: over-reporting only ever evicts more
-      expect(await store.lookup(account, 'stuck.jpg'), isNotNull);
+      // the row stays as it was, so the bytes stay accounted for: over-reporting only ever evicts more
+      expect((await store.lookup(account, 'stuck.jpg'))?.tier, NextcloudMirrorTier.original);
       expect(await store.usedBytes(account), 10);
     });
 
     test('reports a row whose file was already missing', () async {
       final account = accountWith(cacheLimitBytes: 0);
-      // a row with no file on disk: nothing to delete, and the row deletion then fails
+      // a row with no file on disk: nothing to delete, and the row rewrite then fails
       await writeMirrorFile(account, 'ghost.jpg', 10);
       await store.record(account, entryFor('ghost.jpg', sizeBytes: 10));
       await File(store.localPathFor(account, 'ghost.jpg')).delete();
-      index.failDeleteFor.add('ghost.jpg');
+      index.failPutFor.add('ghost.jpg');
 
       expect(await evict(account), {'ghost.jpg'});
     });
@@ -335,7 +359,7 @@ void main() {
     test('stops instead of looping when nothing on the page can go', () async {
       final account = accountWith(cacheLimitBytes: 0);
       await recordWritten(account, 'stuck.jpg', 10);
-      index.failDeleteFor.add('stuck.jpg');
+      index.failPutFor.add('stuck.jpg');
 
       // the path is still reported (its bytes went), but the row left at the head of the LRU order
       // must not count as progress, or the next round would query the same page forever
@@ -446,11 +470,11 @@ void main() {
       await store.record(account, entryFor('aaa-remote-only.mp4', sizeBytes: 3000000000, tier: NextcloudMirrorTier.placeholder));
       await recordWritten(account, 'zzz-big.jpg', 140);
 
-      final removed = await evict(account);
+      final demoted = await evict(account);
 
       // taking the placeholder would reclaim nothing and cost the gallery entry, and the next sync would
       // re-list and recreate it, every single time the budget bites
-      expect(removed, {'zzz-big.jpg'});
+      expect(demoted, {'zzz-big.jpg'});
       expect(await store.lookup(account, 'aaa-remote-only.mp4'), isNotNull, reason: 'a placeholder holds no bytes, so evicting it frees nothing and only makes a hole');
       expect(await store.usedBytes(account), 0);
     });
@@ -468,19 +492,130 @@ void main() {
   });
 
   group('eviction outcome', () {
-    test('reports removals and, for now, never demotions', () async {
+    test('reports demotions and never removals: a victim keeps its row as an unfunded placeholder', () async {
       final account = accountWith(cacheLimitBytes: 100);
       await recordWritten(account, 'a.jpg', 140);
 
       final outcome = await store.evictToFit(account);
 
-      expect(outcome.removed, {'a.jpg'});
-      // structurally empty until a cheaper tier exists to fall back to; asserted so that the leaf adding
-      // the view tier has to come back here and say what demotion means
-      expect(outcome.demoted, isEmpty);
+      expect(outcome.demoted, {'a.jpg'});
+      // a removed row is a listed item with no row: the next sync re-lists the whole tree and funds the
+      // gap by evicting the next row, forever. A demoted row is still in the gallery and still reflects
+      // the server, so the sync has nothing to do about it.
+      expect(outcome.removed, isEmpty);
       expect(outcome.touched, {'a.jpg'});
       expect(outcome.isEmpty, isFalse);
       expect(NextcloudEvictionOutcome.none.isEmpty, isTrue);
+      await expectDemoted(account, 'a.jpg', remoteSizeBytes: 140);
+      expect(await store.usedBytes(account), 0, reason: 'the demoted bytes no longer count');
+    });
+
+    test('a demoted row keeps its pin out of the question: a pinned row is never a victim in either order', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      await recordWritten(account, 'kept.jpg', 10, pinned: true);
+      await recordWritten(account, 'goes.jpg', 10);
+
+      expect(await evictOldestFirst(account), {'goes.jpg'});
+      expect((await store.lookup(account, 'kept.jpg'))?.tier, NextcloudMirrorTier.original);
+      expect(await store.usedBytes(account), 10);
+    });
+  });
+
+  group('sync order', () {
+    final day1 = epoch, day2 = epoch.add(const Duration(days: 1)), day3 = epoch.add(const Duration(days: 2));
+
+    test('takes the oldest remoteLastModified first, whatever was viewed last', () async {
+      final account = accountWith(cacheLimitBytes: 100);
+      // the oldest file is the one viewed most recently: under the access order it would be the last to go
+      await recordWritten(account, 'old.jpg', 50, modified: day1, lastAccessAt: day3);
+      await recordWritten(account, 'mid.jpg', 50, modified: day2, lastAccessAt: day2);
+      await recordWritten(account, 'new.jpg', 50, modified: day3, lastAccessAt: day1);
+
+      expect(await evictOldestFirst(account), {'old.jpg'});
+      expect(await store.usedBytes(account), 100);
+    });
+
+    test('takes every original before any grid row, however old the grid row is', () async {
+      final account = accountWith(cacheLimitBytes: 60);
+      await recordWritten(account, 'thumb.jpg', 10, modified: day1, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'v1.mp4', 50, modified: day2);
+      await recordWritten(account, 'v2.mp4', 50, modified: day3);
+
+      // 110 against 60: one original is enough, and it is the older one, not the oldest row
+      expect(await evictOldestFirst(account), {'v1.mp4'});
+      expect((await store.lookup(account, 'thumb.jpg'))?.tier, NextcloudMirrorTier.grid, reason: 'a library of thumbnails beats whole copies of a few files');
+    });
+
+    test('funding an original may only take originals older than it, never a newer one and never a grid row', () async {
+      final account = accountWith(cacheLimitBytes: 100);
+      await recordWritten(account, 'thumb.jpg', 10, modified: day1, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'older.mp4', 40, modified: day1);
+      await recordWritten(account, 'newer.mp4', 40, modified: day3);
+
+      // 90 held, 95 reserved: a target of 5 that every row together could meet. The bound leaves only
+      // `older.mp4` to take, so the pass stops at 50 with the reservation unmet, rather than taking the
+      // newer original (which the sync ranks above the item) or the grid row (which outranks every original).
+      final funding = NextcloudSyncFunding(tier: NextcloudMirrorTier.original, lastModified: day2);
+      expect(await evictOldestFirst(account, reserveBytes: 95, funding: funding), {'older.mp4'});
+      expect((await store.lookup(account, 'newer.mp4'))?.tier, NextcloudMirrorTier.original, reason: 'a fetch never evicts what the sync ranks above it');
+      expect((await store.lookup(account, 'thumb.jpg'))?.tier, NextcloudMirrorTier.grid);
+      // the caller sees that it did not fit and records the item unfunded
+      expect(await store.usedBytes(account), 50);
+    });
+
+    test('funding a grid row may take any original, and only grid rows older than it', () async {
+      final account = accountWith(cacheLimitBytes: 100);
+      await recordWritten(account, 'older-thumb.jpg', 10, modified: day1, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'newer-thumb.jpg', 10, modified: day3, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'newer.mp4', 80, modified: day3);
+
+      // 100 held, 40 reserved: the newer original goes first (the whole class ranks below grid rows), then
+      // the older thumbnail; the newer thumbnail is out of bounds
+      final funding = NextcloudSyncFunding(tier: NextcloudMirrorTier.grid, lastModified: day2);
+      expect(await evictOldestFirst(account, reserveBytes: 40, funding: funding), {'newer.mp4'});
+      expect(await store.usedBytes(account), 20);
+
+      // and with more to reclaim than the originals hold, the bound on grid rows is what stops it
+      expect(await evictOldestFirst(account, reserveBytes: 95, funding: funding), {'older-thumb.jpg'});
+      expect((await store.lookup(account, 'newer-thumb.jpg'))?.tier, NextcloudMirrorTier.grid);
+      expect(await store.usedBytes(account), 10);
+    });
+
+    test('a sweep with nothing to fund is unbounded: originals oldest first, then grid rows oldest first', () async {
+      final account = accountWith(cacheLimitBytes: 0);
+      await recordWritten(account, 'thumb-old.jpg', 10, modified: day1, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'thumb-new.jpg', 10, modified: day3, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'v.mp4', 10, modified: day2);
+
+      expect(await evictOldestFirst(account), {'thumb-old.jpg', 'thumb-new.jpg', 'v.mp4'});
+      expect(await store.usedBytes(account), 0);
+      // the order is visible in which rows went first when the target is met part way
+      await recordWritten(account, 'a.jpg', 10, modified: day1, tier: NextcloudMirrorTier.grid);
+      await recordWritten(account, 'b.mp4', 10, modified: day3);
+      final partial = accountWith(cacheLimitBytes: 10);
+      expect(await evictOldestFirst(partial), {'b.mp4'}, reason: 'the original goes before the older grid row');
+    });
+
+    test('pages through the originals and then the grid rows', () async {
+      // 300 originals and 300 grid rows against a 256-row page, so each class takes more than one page
+      final account = accountWith(cacheLimitBytes: 0);
+      for (var i = 0; i < 300; i++) {
+        await recordWritten(
+          account,
+          'photo$i.jpg',
+          1,
+          modified: epoch.add(Duration(minutes: i)),
+          tier: NextcloudMirrorTier.grid,
+        );
+        await recordWritten(account, 'video$i.mp4', 1, modified: epoch.add(Duration(minutes: i)));
+      }
+
+      final demoted = await evictOldestFirst(account);
+
+      expect(demoted.length, 600);
+      expect(await store.usedBytes(account), 0);
+      expect(index.getOldestModifiedCalls, greaterThan(2));
+      expect(index.getLeastRecentlyAccessedCalls, 0, reason: 'the sync order never consults the access order');
     });
   });
 }

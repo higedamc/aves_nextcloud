@@ -12,7 +12,7 @@ import 'package:aves/model/nextcloud/repository.dart';
 //        added/updated → download (newest `lastModified` first), `record`, then create the `AvesEntry`
 //        via `mediaFetchService.getEntry(Uri.file(localPath))` with `origin = EntryOrigins.nextcloud`,
 //        removed on server → `mirrorStore.remove` + `source.removeEntries`.
-//   4. `evictToFit` → `source.removeEntries` for evicted paths.
+//   4. `evictToFit` → the sink demotes the entries of evicted paths (the rows survive as placeholders).
 //   5. Run in the main app isolate only: `localMediaDb.nextId` is process-local.
 // v1 is strictly one-way (server → device). No write ever goes to the server.
 class NextcloudSyncRequest {
@@ -42,6 +42,11 @@ class NextcloudSyncProgress {
 class NextcloudSyncResult {
   final int added, updated, removed, skipped, evicted;
 
+  // rows whose bytes the budget took back: still in the gallery as placeholders, streamed on demand. Not
+  // `evicted`, which counts rows that left the mirror altogether; the distinction decides whether the
+  // run's etags survive, see the use case.
+  final int demoted;
+
   // rows whose mirror file was missing and that the listing could not refill: dropped with their entries
   final int lost;
 
@@ -57,6 +62,7 @@ class NextcloudSyncResult {
     this.removed = 0,
     this.skipped = 0,
     this.evicted = 0,
+    this.demoted = 0,
     this.lost = 0,
     this.itemFailures = const {},
     this.fatal,
@@ -65,7 +71,7 @@ class NextcloudSyncResult {
   bool get isSuccess => fatal == null;
 
   @override
-  String toString() => '$runtimeType{added=$added, updated=$updated, removed=$removed, skipped=$skipped, evicted=$evicted, lost=$lost, itemFailures=${itemFailures.length}, fatal=$fatal}';
+  String toString() => '$runtimeType{added=$added, updated=$updated, removed=$removed, skipped=$skipped, evicted=$evicted, demoted=$demoted, lost=$lost, itemFailures=${itemFailures.length}, fatal=$fatal}';
 }
 
 abstract class NextcloudSyncUseCase {

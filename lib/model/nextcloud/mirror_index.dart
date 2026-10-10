@@ -24,6 +24,13 @@ abstract class NextcloudMirrorIndex {
   // would sit at the head of this order forever.
   Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit});
 
+  // Oldest `remoteLastModified` first, at most `limit` rows, among the unpinned rows whose tier is in
+  // `tiers` and, when `modifiedBefore` is given, whose `remoteLastModified` is strictly before it. The
+  // sync's eviction order (`NextcloudEvictionOrder.oldestFirst`): the tier filter is how originals go
+  // before grid rows, and the bound is how a fetch is kept from evicting anything it would rank above.
+  // `placeholder` rows are never returned whatever `tiers` says, for the reason above.
+  Future<List<NextcloudMirrorIndexEntry>> getOldestModified(NextcloudAccount account, {required int limit, required Set<NextcloudMirrorTier> tiers, DateTime? modifiedBefore});
+
   // Inserts or replaces the row for `entry.relativePath`.
   Future<void> put(NextcloudAccount account, NextcloudMirrorIndexEntry entry);
 

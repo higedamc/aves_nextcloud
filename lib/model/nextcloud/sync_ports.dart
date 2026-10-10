@@ -31,8 +31,19 @@ abstract class NextcloudSyncSink {
   // sink would stat it, fail, and report a parse failure for an item that is in fact fine.
   Future<bool> putPlaceholder(NextcloudAccount account, NextcloudRemoteItem item);
 
-  // Removes the entries of mirrored files that are gone (removed on the server, evicted, or missing).
+  // Removes the entries of mirrored files that are gone (removed on the server, or missing).
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths);
+
+  // The bytes behind these entries were given back to the budget, and their mirror rows survive as
+  // `placeholder` rows (`NextcloudMirrorStore.evictToFit` never removes a row). The entries stay, with
+  // their ids, favourites, covers, catalogue and address: what the device read from the bytes is better
+  // than anything the server's properties could put in their place, and a row under a subtree the run
+  // trusted by etag was never listed, so there is no `NextcloudRemoteItem` to hand a builder anyway. Only
+  // what described the bytes is dropped — the cached images for the URI, and a visual change is announced —
+  // so that the tile and the viewer evaluate the entry again as one with no file, the same way they would
+  // a placeholder recorded as such. Paths without an entry in the loaded collection are skipped: nothing
+  // cached describes their bytes.
+  Future<void> demoteToPlaceholders(NextcloudAccount account, Set<String> relativePaths);
 }
 
 // What a run knows about the previous one: the collection etags that were fully enumerated, and the cache
@@ -54,6 +65,12 @@ abstract class NextcloudSyncSink {
 //   is its own call; the rule only has to admit the outcome.
 // - the `view` and `original` tiers never enter the rule. They are fetched on demand, so requiring them
 //   would mean no root etag is ever published again.
+// - a `placeholder` row the **budget** left there (`NextcloudPlaceholderReason.unfunded`: the run could not
+//   fund the item, or took its bytes back to fund a newer one) satisfies whatever tier the run wanted. The
+//   mirror reflects the server honestly in that state — the item is listed, in the gallery, and nothing the
+//   server could say would change what is held — and a raised cache limit lists everything again, which is
+//   when the planning step treats such a row as a gap. A placeholder left for a *policy* reason (above the
+//   threshold, or the server cannot derive it) is the case above: it satisfies `grid`, not `original`.
 //
 // The tier ordering is what makes this survivable in both directions: a row that holds an explicitly
 // downloaded original satisfies a grid requirement, so an upgrade from a tier-less index (where every row

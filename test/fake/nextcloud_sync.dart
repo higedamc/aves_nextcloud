@@ -274,6 +274,7 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       etag: entry.etag,
       fileId: entry.fileId,
       tier: entry.tier,
+      placeholderReason: entry.placeholderReason,
       remoteSizeBytes: entry.remoteSizeBytes,
       localSizeBytes: stat?.size ?? 0,
       pinned: entry.pinned,
@@ -300,25 +301,52 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   Future<int> usedBytes(NextcloudAccount account) async => rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
 
   @override
-  Future<NextcloudEvictionOutcome> evictToFit(NextcloudAccount account, {int reserveBytes = 0}) async {
+  Future<NextcloudEvictionOutcome> evictToFit(
+    NextcloudAccount account, {
+    int reserveBytes = 0,
+    NextcloudEvictionOrder order = NextcloudEvictionOrder.leastRecentlyAccessed,
+    NextcloudSyncFunding? funding,
+  }) async {
     evictCalls.add('${account.id}:$reserveBytes');
     final target = (account.cacheLimitBytes - reserveBytes).clamp(0, account.cacheLimitBytes);
-    final evicted = <String>{};
+    final demoted = <String>{};
     var used = await usedBytes(account);
     // mirrors the real store: neither a pinned row nor a placeholder is a candidate
-    final candidates = rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList()
-      ..sort((a, b) {
-        final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
-        return byAccess != 0 ? byAccess : a.relativePath.compareTo(b.relativePath);
-      });
+    final all = rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList();
+    int byPath(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) => a.relativePath.compareTo(b.relativePath);
+    final List<NextcloudMirrorIndexEntry> candidates;
+    switch (order) {
+      case NextcloudEvictionOrder.leastRecentlyAccessed:
+        candidates = all
+          ..sort((a, b) {
+            final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
+            return byAccess != 0 ? byAccess : byPath(a, b);
+          });
+      case NextcloudEvictionOrder.oldestFirst:
+        // same order and bound as the real store: originals (and view rows) before grid rows, oldest
+        // `remoteLastModified` first; an original may only take rows older than itself and never a grid
+        // row, a grid row may take any original and only grid rows older than itself
+        final fundsGrid = funding == null || funding.tier == NextcloudMirrorTier.grid;
+        bool older(NextcloudMirrorIndexEntry v) => funding == null || v.remoteLastModified.isBefore(funding.lastModified);
+        int byDate(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) {
+          final cmp = a.remoteLastModified.compareTo(b.remoteLastModified);
+          return cmp != 0 ? cmp : byPath(a, b);
+        }
+
+        final bytes = all.where((v) => v.tier != NextcloudMirrorTier.grid && (fundsGrid || older(v))).toList()..sort(byDate);
+        final grids = fundsGrid ? (all.where((v) => v.tier == NextcloudMirrorTier.grid && older(v)).toList()..sort(byDate)) : const <NextcloudMirrorIndexEntry>[];
+        candidates = [...bytes, ...grids];
+    }
     for (final victim in candidates) {
       if (used <= target) break;
-      await remove(account, victim.relativePath);
-      evicted.add(victim.relativePath);
+      // demotion, as in the real store: the file goes, the row stays as an unfunded placeholder
+      final file = File(localPathFor(account, victim.relativePath));
+      if (await file.exists()) await file.delete();
+      rows(account)[victim.relativePath] = victim.asUnfundedPlaceholder();
+      demoted.add(victim.relativePath);
       used -= victim.localSizeBytes;
     }
-    // no demotions: this fake mirrors the real store, which has no cheaper tier to fall back to yet
-    return NextcloudEvictionOutcome(removed: evicted);
+    return NextcloudEvictionOutcome(demoted: demoted);
   }
 
   @override
@@ -341,7 +369,12 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
   // port method is that a placeholder and a mirrored file cannot be confused for one another
   final List<String> placeholders = [];
 
+  // paths whose bytes the budget took back, per call; the entries survive
+  final List<Set<String>> demotions = [];
+
   Set<String> get removed => removals.expand((v) => v).toSet();
+
+  Set<String> get demoted => demotions.expand((v) => v).toSet();
 
   @override
   Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier) async {
@@ -361,6 +394,9 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
 
   @override
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths) async => removals.add(Set.of(relativePaths));
+
+  @override
+  Future<void> demoteToPlaceholders(NextcloudAccount account, Set<String> relativePaths) async => demotions.add(Set.of(relativePaths));
 }
 
 class MemoryNextcloudSyncStateStore implements NextcloudSyncStateStore {

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:aves/model/covers.dart';
+import 'package:aves/model/entry/cache.dart';
 import 'package:aves/model/entry/entry.dart';
 import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/favourites.dart';
@@ -120,7 +121,11 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     // the device cataloguer to do, and promotion recovers everything once an `original` put arrives with
     // `presetCatalog: null` and takes the forced-catalog branch.
     final presetCatalog = catalogMetadataFromPhotoMetadata(synthesised.id, item.photoMetadata);
-    return _putEntry(uri, synthesised.copyWith(uri: uri, path: localPath), presetCatalog: presetCatalog);
+    return _putEntry(
+      uri,
+      synthesised.copyWith(uri: uri, path: localPath),
+      presetCatalog: presetCatalog,
+    );
   }
 
   // insert-or-refresh for one URI, shared by both puts: everything below is about reconciling the DB row,
@@ -185,6 +190,25 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   Future<void> removeMirroredFiles(NextcloudAccount account, Set<String> relativePaths) async {
     if (relativePaths.isEmpty) return;
     await _removeUris(relativePaths.map((path) => _uriFor(account, path)).toSet());
+  }
+
+  @override
+  Future<void> demoteToPlaceholders(NextcloudAccount account, Set<String> relativePaths) async {
+    if (relativePaths.isEmpty) return;
+    final index = await _idByUri;
+    for (final path in relativePaths) {
+      final uri = _uriFor(account, path);
+      final id = index[uri];
+      final entry = id == null ? null : _source.getEntryById(id);
+      // a row outside the loaded scope (or none): nothing cached describes its bytes, and the next full
+      // load reads the entry as it is, which is still the right entry
+      if (entry == null) continue;
+      // the decoded thumbnails and full images for this URI are of bytes that are no longer there; the
+      // notifier is what the thumbnail and viewer widgets listen to, and it is announced after the
+      // eviction so a listener that reloads does not find the stale image again
+      EntryCache.evict(uri);
+      entry.visualChangeNotifier.notify();
+    }
   }
 
   // every entry under the account's mirror, with or without an index row (used by a purge)

@@ -131,6 +131,7 @@ void main() {
           etag: 'e1',
           fileId: 1,
           tier: NextcloudMirrorTier.placeholder,
+          placeholderReason: NextcloudPlaceholderReason.policy,
           remoteSizeBytes: 3000000000,
           localSizeBytes: 0,
           remoteLastModified: DateTime.fromMillisecondsSinceEpoch(1000),
@@ -177,7 +178,9 @@ void main() {
       final columns = await db.rawQuery('PRAGMA table_info(${SqfliteNextcloudMirrorIndex.table})');
       final names = columns.map((v) => v['name']).toSet();
       expect(names, isNot(contains('sizeBytes')));
-      expect(names, containsAll(<String>['tier', 'remoteSizeBytes', 'localSizeBytes', 'pinned']));
+      expect(names, containsAll(<String>['tier', 'placeholderReason', 'remoteSizeBytes', 'localSizeBytes', 'pinned']));
+      // a v1 file upgrades straight to the latest schema: the sync's eviction order is indexed too
+      expect(indexes.map((v) => v['name']), contains('${SqfliteNextcloudMirrorIndex.table}_remoteLastModified'));
 
       // and the staging table did not survive the rename
       final tables = await db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'table'");
@@ -211,6 +214,214 @@ void main() {
       // the two sizes must not collapse into one another: this is the pair that, confused, reports a
       // few hundred megabytes of previews as the size of the whole remote library
       expect(row.localSizeBytes, isNot(row.remoteSizeBytes));
+    });
+  });
+
+  group('v2 to v3 upgrade', () {
+    late String dbPath;
+
+    setUp(() async {
+      dbPath = '${await databaseFactory.getDatabasesPath()}/nextcloud_mirror.db';
+      await databaseFactory.deleteDatabase(dbPath);
+    });
+
+    // exactly the v2 schema as shipped, so the test fails if the real `onUpgrade` is written against a
+    // shape that was never on a device
+    Future<void> writeV2(List<Map<String, Object?>> rows) async {
+      final db = await databaseFactory.openDatabase(
+        dbPath,
+        options: OpenDatabaseOptions(
+          version: 2,
+          onCreate: (db, version) async {
+            await db.execute('''CREATE TABLE ${SqfliteNextcloudMirrorIndex.table}(
+              accountId TEXT NOT NULL
+              , relativePath TEXT NOT NULL
+              , etag TEXT NOT NULL
+              , fileId INTEGER
+              , tier TEXT NOT NULL
+              , remoteSizeBytes INTEGER NOT NULL
+              , localSizeBytes INTEGER NOT NULL
+              , pinned INTEGER NOT NULL
+              , remoteLastModified INTEGER NOT NULL
+              , downloadedAt INTEGER NOT NULL
+              , lastAccessAt INTEGER NOT NULL
+              , PRIMARY KEY (accountId, relativePath)
+              )''');
+            await db.execute('CREATE INDEX ${SqfliteNextcloudMirrorIndex.table}_lastAccessAt ON ${SqfliteNextcloudMirrorIndex.table}(accountId, lastAccessAt)');
+          },
+        ),
+      );
+      for (final row in rows) {
+        await db.insert(SqfliteNextcloudMirrorIndex.table, row);
+      }
+      await db.close();
+    }
+
+    Map<String, Object?> v2Row(String relativePath, {required NextcloudMirrorTier tier, int localSizeBytes = 0, int remoteLastModified = 1000}) => {
+      'accountId': account.id,
+      'relativePath': relativePath,
+      'etag': 'etag-$relativePath',
+      'fileId': 7,
+      'tier': tier.name,
+      'remoteSizeBytes': 500,
+      'localSizeBytes': localSizeBytes,
+      'pinned': 0,
+      'remoteLastModified': remoteLastModified,
+      'downloadedAt': 2000,
+      'lastAccessAt': 3000,
+    };
+
+    test('a v2 placeholder reads as a policy placeholder, and every other row carries no reason', () async {
+      await writeV2([v2Row('above.mp4', tier: NextcloudMirrorTier.placeholder), v2Row('a.jpg', tier: NextcloudMirrorTier.grid, localSizeBytes: 18062)]);
+
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+
+      // every placeholder a v2 binary wrote was a threshold or a 404, so this is a fact about the rows,
+      // not a default. Read as `unfunded`, every such row would be planned as a gap on the next relist and
+      // the preview endpoint asked again for files it already answered 404 for.
+      final placeholder = await index.get(account, 'above.mp4');
+      expect(placeholder!.tier, NextcloudMirrorTier.placeholder);
+      expect(placeholder.placeholderReason, NextcloudPlaceholderReason.policy);
+      final grid = await index.get(account, 'a.jpg');
+      expect(grid!.tier, NextcloudMirrorTier.grid);
+      expect(grid.placeholderReason, isNull);
+      expect(grid.localSizeBytes, 18062, reason: 'an in-place column add touches nothing else');
+    });
+
+    test('the upgrade adds the sync order index and leaves the access index in place', () async {
+      await writeV2([v2Row('a.jpg', tier: NextcloudMirrorTier.grid)]);
+
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      final db = await databaseFactory.openDatabase(dbPath, options: OpenDatabaseOptions(singleInstance: true));
+
+      final indexes = await db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", [SqfliteNextcloudMirrorIndex.table]);
+      expect(indexes.map((v) => v['name']), containsAll(<String>['${SqfliteNextcloudMirrorIndex.table}_lastAccessAt', '${SqfliteNextcloudMirrorIndex.table}_remoteLastModified']));
+      final columns = await db.rawQuery('PRAGMA table_info(${SqfliteNextcloudMirrorIndex.table})');
+      expect(columns.map((v) => v['name']), contains('placeholderReason'));
+    });
+
+    test('a migrated database accepts a put of every tier, with and without a reason', () async {
+      await writeV2([v2Row('a.jpg', tier: NextcloudMirrorTier.grid)]);
+
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      // the v2 lesson, in the other direction: an added column must not break the next insert
+      await index.put(
+        account,
+        NextcloudMirrorIndexEntry(
+          relativePath: 'b.jpg',
+          etag: 'e',
+          fileId: 2,
+          tier: NextcloudMirrorTier.grid,
+          remoteSizeBytes: 10,
+          localSizeBytes: 2,
+          remoteLastModified: DateTime.fromMillisecondsSinceEpoch(1),
+          downloadedAt: DateTime.fromMillisecondsSinceEpoch(1),
+          lastAccessAt: DateTime.fromMillisecondsSinceEpoch(1),
+        ),
+      );
+      await index.put(
+        account,
+        NextcloudMirrorIndexEntry(
+          relativePath: 'v.mp4',
+          etag: 'e',
+          fileId: 3,
+          tier: NextcloudMirrorTier.placeholder,
+          placeholderReason: NextcloudPlaceholderReason.unfunded,
+          remoteSizeBytes: 10,
+          localSizeBytes: 0,
+          remoteLastModified: DateTime.fromMillisecondsSinceEpoch(1),
+          downloadedAt: DateTime.fromMillisecondsSinceEpoch(1),
+          lastAccessAt: DateTime.fromMillisecondsSinceEpoch(1),
+        ),
+      );
+
+      expect((await index.get(account, 'b.jpg'))?.placeholderReason, isNull);
+      expect((await index.get(account, 'v.mp4'))?.placeholderReason, NextcloudPlaceholderReason.unfunded);
+    });
+
+    test('a reason this binary cannot read is a policy placeholder, as before the column existed', () async {
+      await writeV2([v2Row('x.mp4', tier: NextcloudMirrorTier.placeholder)]);
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      final db = await databaseFactory.openDatabase(dbPath, options: OpenDatabaseOptions(singleInstance: true));
+      await db.update(SqfliteNextcloudMirrorIndex.table, {'placeholderReason': 'from-the-future'}, where: 'relativePath = ?', whereArgs: ['x.mp4']);
+
+      expect((await index.get(account, 'x.mp4'))?.placeholderReason, NextcloudPlaceholderReason.policy);
+    });
+  });
+
+  group('oldest modified query', () {
+    late SqfliteNextcloudMirrorIndex index;
+    final epoch = DateTime.fromMillisecondsSinceEpoch(1000);
+
+    NextcloudMirrorIndexEntry rowFor(String relativePath, {required NextcloudMirrorTier tier, required int modified, bool pinned = false, int lastAccess = 0}) => NextcloudMirrorIndexEntry(
+      relativePath: relativePath,
+      etag: 'e',
+      fileId: 1,
+      tier: tier,
+      placeholderReason: tier == NextcloudMirrorTier.placeholder ? NextcloudPlaceholderReason.unfunded : null,
+      remoteSizeBytes: 10,
+      localSizeBytes: tier == NextcloudMirrorTier.placeholder ? 0 : 10,
+      pinned: pinned,
+      remoteLastModified: epoch.add(Duration(days: modified)),
+      downloadedAt: epoch,
+      lastAccessAt: epoch.add(Duration(days: lastAccess)),
+    );
+
+    setUp(() async {
+      await databaseFactory.deleteDatabase('${await databaseFactory.getDatabasesPath()}/nextcloud_mirror.db');
+      index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+    });
+
+    // the order and the bound live in the SQL, so the fake index agreeing with the contract proves nothing here
+    test('orders by remoteLastModified then path, ignoring the access order', () async {
+      await index.put(account, rowFor('b.mp4', tier: NextcloudMirrorTier.original, modified: 2, lastAccess: 0));
+      await index.put(account, rowFor('a.mp4', tier: NextcloudMirrorTier.original, modified: 2, lastAccess: 9));
+      await index.put(account, rowFor('z.mp4', tier: NextcloudMirrorTier.original, modified: 1, lastAccess: 5));
+
+      final rows = await index.getOldestModified(account, limit: 10, tiers: {NextcloudMirrorTier.original});
+      expect(rows.map((v) => v.relativePath), ['z.mp4', 'a.mp4', 'b.mp4']);
+    });
+
+    test('filters by tier and by a strict bound on remoteLastModified', () async {
+      await index.put(account, rowFor('old.mp4', tier: NextcloudMirrorTier.original, modified: 1));
+      await index.put(account, rowFor('same.mp4', tier: NextcloudMirrorTier.original, modified: 2));
+      await index.put(account, rowFor('new.mp4', tier: NextcloudMirrorTier.original, modified: 3));
+      await index.put(account, rowFor('old.jpg', tier: NextcloudMirrorTier.grid, modified: 1));
+
+      final before = epoch.add(const Duration(days: 2));
+      final originals = await index.getOldestModified(account, limit: 10, tiers: {NextcloudMirrorTier.original}, modifiedBefore: before);
+      // strictly before: an item with the same date as the one being funded is not older than it
+      expect(originals.map((v) => v.relativePath), ['old.mp4']);
+      final grids = await index.getOldestModified(account, limit: 10, tiers: {NextcloudMirrorTier.grid}, modifiedBefore: before);
+      expect(grids.map((v) => v.relativePath), ['old.jpg']);
+      final both = await index.getOldestModified(account, limit: 10, tiers: {NextcloudMirrorTier.original, NextcloudMirrorTier.grid});
+      expect(both.map((v) => v.relativePath), ['old.jpg', 'old.mp4', 'same.mp4', 'new.mp4']);
+    });
+
+    test('never offers a pinned row or a placeholder, whatever tiers it is asked for', () async {
+      await index.put(account, rowFor('pinned.mp4', tier: NextcloudMirrorTier.original, modified: 1, pinned: true));
+      await index.put(account, rowFor('aaa.mp4', tier: NextcloudMirrorTier.placeholder, modified: 0));
+      await index.put(account, rowFor('free.mp4', tier: NextcloudMirrorTier.original, modified: 2));
+
+      final rows = await index.getOldestModified(account, limit: 10, tiers: NextcloudMirrorTier.values.toSet());
+      expect(rows.map((v) => v.relativePath), ['free.mp4']);
+      expect(await index.getOldestModified(account, limit: 10, tiers: {NextcloudMirrorTier.placeholder}), isEmpty);
+    });
+
+    test('pages and stays within the account', () async {
+      final other = NextcloudAccount(id: 'acc2', serverUrl: account.serverUrl, username: 'bob', rootFolder: '', cacheLimitBytes: 1000);
+      for (var i = 0; i < 5; i++) {
+        await index.put(account, rowFor('v$i.mp4', tier: NextcloudMirrorTier.original, modified: i));
+      }
+      await index.put(other, rowFor('theirs.mp4', tier: NextcloudMirrorTier.original, modified: 0));
+
+      final page = await index.getOldestModified(account, limit: 2, tiers: {NextcloudMirrorTier.original});
+      expect(page.map((v) => v.relativePath), ['v0.mp4', 'v1.mp4']);
     });
   });
 }

@@ -32,8 +32,14 @@ import 'package:aves/model/nextcloud/sync_ports.dart';
 //   unchanged-root fast path) rests on Nextcloud propagating every etag change to all ancestors: the promise
 //   only stays true because any later change under it bumps it. Against a WebDAV server that does not
 //   propagate, this is silently stale.
-// - Downloads go newest first, within the cache budget. When making room would evict a file downloaded in
-//   this run, the remaining (older) files are counted as skipped rather than thrashing the cache.
+// - Downloads go the whole grid class first, then originals, newest first within each, and the budget's
+//   eviction may only take rows the sync ranks below the item it is funding (`NextcloudSyncFunding`). An
+//   item the budget cannot fund gets an `unfunded` placeholder row — in the gallery, streamed on demand —
+//   and so does every row the budget takes back: eviction demotes, it never removes. Both are what let a
+//   run that fits less than the server holds still end with the mirror honestly reflecting the server, so
+//   that its etags publish and the next run has nothing to do. Without them a sync over budget is a
+//   treadmill: it re-lists the whole tree on every run and funds last run's gap by evicting last run's
+//   fetch, indefinitely, and it looks like a working sync while doing it (measured, see the leaf briefs).
 class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   final NextcloudRepositoryFactory _repositories;
   final NextcloudCredentialStore _credentials;
@@ -116,9 +122,10 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           if (!existing.pinned) await _mirror.record(account, existing.copyWith(pinned: true, lastAccessAt: _now()));
           return null;
         }
-        final reserve = item.sizeBytes;
-        if (reserve > account.cacheLimitBytes) {
-          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes);
+        // net of the bytes already held at this path, which the download replaces (see `_download`)
+        final reserve = math.max(0, item.sizeBytes - (existing?.localSizeBytes ?? 0));
+        if (item.sizeBytes > account.cacheLimitBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes);
         }
         final stats = _Stats();
         final eviction = await _mirror.evictToFit(account, reserveBytes: reserve);
@@ -200,7 +207,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           // A row at a later tier than wanted is current (an original answers for a placeholder), so an
           // already-held video is never downgraded when the threshold drops below its size; a row at an
           // earlier tier is not, so raising the threshold promotes a placeholder to an original.
-          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath) && _holds(row, _wantedTier(account, item));
+          final current = row != null && row.etag == item.etag && !missing.contains(item.relativePath) && _isCurrent(row, _wantedTier(account, item), relist: relist);
           if (current && !request.force) {
             stats.skipped++;
           } else {
@@ -235,7 +242,9 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         final Map<String, String> etags;
         if (stats.evicted > 0 || stats.lost > 0) {
           // a file left the mirror without the server knowing: it may sit under a subtree this run skipped on
-          // an old etag, and no server etag will ever point at it again, so everything is listed next time
+          // an old etag, and no server etag will ever point at it again, so everything is listed next time.
+          // `evicted` counts rows that left the mirror, never demotions; `_applyEviction` says why that
+          // omission is load-bearing.
           etags = const {};
         } else if (await _mirrorReflects(account, listing.items.values, fetched)) {
           // `known` rather than the stored map: a relisting run must not resurrect etags it was told to ignore
@@ -286,9 +295,10 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       final row = rows[path];
       if (row == null) return false;
       if (row.etag != item.etag && !fetched.contains(path)) return false;
-      // a row below the wanted tier (a placeholder video whose threshold was raised, left there by the
-      // budget) is a gap: promising the subtree would skip it on every later run and never promote it
-      if (!_holds(row, _wantedTier(account, item))) return false;
+      // a row below the wanted tier for a reason the budget cannot change (a placeholder video whose
+      // threshold was raised) is a gap: promising the subtree would skip it on every later run and never
+      // promote it. One the budget left there is not, see `_reflects`.
+      if (!_reflects(row, _wantedTier(account, item))) return false;
       if (row.tier == NextcloudMirrorTier.placeholder) continue;
       if (!await File(_mirror.localPathFor(account, path)).exists()) return false;
     }
@@ -309,14 +319,42 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     return NextcloudMirrorTier.grid;
   }
 
-  // Whether a row answers for the tier a run wants. Tier order decides it, with one policy on top: a
-  // `placeholder` answers for `grid`, because it is what a run records when the server cannot derive the
-  // item at all (HEIC under the default providers answers 404), and nothing more can be done for it until
-  // the file changes. It does not answer for `original`, which is a video the threshold now admits whole:
-  // that row is a gap to be promoted, not an outcome.
-  static bool _holds(NextcloudMirrorIndexEntry row, NextcloudMirrorTier wanted) {
+  // Whether a row answers for the tier a run wants is two questions, not one, and the budget is where they
+  // part. The planning step asks *is there anything left for a sync to do for this item*, which is
+  // budget-sensitive; the completeness rule asks *does the mirror honestly reflect the server*, which is
+  // not. One shared predicate forced "the budget could not fund this" to be either a gap for both or
+  // current for both, and neither is right: as a gap for both it withholds the etags and re-lists the tree
+  // on every run, as current for both a raised budget never promotes it. So there are two.
+  //
+  // Both agree on everything but the `unfunded` placeholder. Tier order decides first, then one policy on
+  // top: a `policy` placeholder answers for `grid`, because it is what a run records when the server cannot
+  // derive the item at all (HEIC under the default providers answers 404), and nothing more can be done for
+  // it until the file changes. It does not answer for `original`, which is a video the threshold now admits
+  // whole: that row is a gap to be promoted, not an outcome.
+
+  // Planning. An `unfunded` placeholder is current until the budget changes, and a raised `cacheLimitBytes`
+  // is what `relist` means (a forced run too, which re-plans everything regardless), so that is when it is
+  // a gap again: planned, sorted with the rest, and funded if the new budget reaches it.
+  static bool _isCurrent(NextcloudMirrorIndexEntry row, NextcloudMirrorTier wanted, {required bool relist}) {
     if (row.satisfies(wanted)) return true;
-    return row.tier == NextcloudMirrorTier.placeholder && wanted == NextcloudMirrorTier.grid;
+    return switch (row.placeholderReason) {
+      null => false,
+      NextcloudPlaceholderReason.policy => wanted == NextcloudMirrorTier.grid,
+      NextcloudPlaceholderReason.unfunded => !relist,
+    };
+  }
+
+  // Completeness. An `unfunded` placeholder reflects the server whatever the budget: the item is listed,
+  // in the gallery, and nothing the server could tell a later run would change what the mirror holds for
+  // it. Promising the subtree is therefore honest, and it is what lets a run over budget stop walking the
+  // whole tree.
+  static bool _reflects(NextcloudMirrorIndexEntry row, NextcloudMirrorTier wanted) {
+    if (row.satisfies(wanted)) return true;
+    return switch (row.placeholderReason) {
+      null => false,
+      NextcloudPlaceholderReason.policy => wanted == NextcloudMirrorTier.grid,
+      NextcloudPlaceholderReason.unfunded => true,
+    };
   }
 
   // The tier a run fetches: the wanted one, unless the row already holds more. A `force` run re-fetches
@@ -360,25 +398,24 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     var done = 0;
     var bytesDone = 0;
     final fetchedThisRun = <String>{};
-    var fetchedBytes = 0;
     emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
 
-    // Partitioned, so that the byte loop below only ever sees items that need bytes. Its two breaks (the
-    // budget is spent; an eviction touched this run's own fetch) abandon everything sorted behind them, and
-    // a placeholder costs nothing: left in the same list, every above-threshold video behind the break
-    // would end the run with no row, no entry and no failure, counted as skipped by a budget that has no
-    // bearing on it. Which videos appeared in the gallery would then depend on where the break fell.
+    // Three classes, in the order the budget serves them. Placeholders cost nothing and go first so that no
+    // budget decision can abandon one. Then the whole grid class before any original, newest first within
+    // each: with one newest-first list, a run of recent video would push every older image's few kilobytes
+    // of thumbnail behind the break, and that is a photo library of placeholders with no thumbnails. Where
+    // the grid class alone exceeds the budget, this means no original is ever funded, and that is the right
+    // degradation — thumbnails for everything beats whole copies of a few.
     NextcloudMirrorTier tierOf(NextcloudRemoteItem item) => _fetchTier(account, item, rows[item.relativePath]);
     final placeholders = downloads.where((item) => tierOf(item) == NextcloudMirrorTier.placeholder).toList();
-    final fetches = downloads.where((item) => tierOf(item) != NextcloudMirrorTier.placeholder).toList();
+    final grids = downloads.where((item) => tierOf(item) == NextcloudMirrorTier.grid).toList();
+    final originals = downloads.where((item) => tierOf(item).index > NextcloudMirrorTier.grid.index).toList();
 
     for (final item in placeholders) {
       _checkCancelled(cancellation);
       final path = item.relativePath;
       try {
-        await _recordPlaceholder(account, item, rows[path], stats);
-        // Coupled to the eviction-touched break below, which reads this set: it cannot false-trigger on a
-        // placeholder today only because a placeholder is never an eviction candidate.
+        await _recordPlaceholder(account, item, rows[path], stats, reason: NextcloudPlaceholderReason.policy);
         fetchedThisRun.add(path);
       } on NextcloudFailure catch (e) {
         if (_isFatal(e)) rethrow;
@@ -388,39 +425,61 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
     }
 
-    for (var i = 0; i < fetches.length; i++) {
+    // The bytes still free once the budget has said no to an item, exact until the next fetch lands; null
+    // while the budget has not said no yet. Everything behind that first "no" is decided by this number
+    // rather than by another eviction pass, and the arithmetic is sound because of the order: under
+    // `NextcloudEvictionOrder.oldestFirst` a pass stops either when the reservation fits or when the rows
+    // the item may take run out, so a "no" means the latter — nothing older in its classes is left. Every
+    // item behind it in this loop ranks below it (older in the same class, or an original behind a grid
+    // row), so its candidates are a subset of that nothing, and only a smaller reservation can still fit.
+    int? free;
+
+    for (final item in [...grids, ...originals]) {
       _checkCancelled(cancellation);
-      final item = fetches[i];
       final path = item.relativePath;
       final existing = rows[path];
       final tier = tierOf(item);
-      final reserve = _reserveFor(item, tier);
+      // Net of the bytes already held at this path: a changed file is fetched over its own old bytes, so
+      // the budget only has to find the difference. Reserved in full, a changed newest file would demote
+      // the next-newest to make room it does not need, and the held set would stop being a function of
+      // the server's order. The old bytes stay on disk until the rename, so the mirror can briefly exceed
+      // the limit by their size; the index never counts a `.part` file, so nothing is misreported.
+      final reserve = math.max(0, _reserveFor(item, tier) - (existing?.localSizeBytes ?? 0));
       try {
+        final bool funded;
         if (reserve > account.cacheLimitBytes) {
-          // never empty the whole mirror for a file that cannot fit anyway
-          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes);
-        }
-        if (fetchedBytes + reserve > account.cacheLimitBytes) {
-          // the budget is full of this run's newest files; the rest are older and would only thrash
-          stats.skipped += fetches.length - i;
-          break;
-        }
-        // make room first; whatever goes must leave the collection in the same step
-        final eviction = await _mirror.evictToFit(account, reserveBytes: reserve);
-        if (!eviction.isEmpty) {
-          await _applyEviction(account, eviction, stats);
-          // `touched`, not `removed`: a file this run fetched is just as lost to it if the store demoted
-          // it to a cheaper tier as if the store deleted it
-          if (eviction.touched.any(fetchedThisRun.contains)) {
-            // a refreshed file keeps its old LRU position, so the store may still pick one of this run's
-            // files: stop here rather than trade the newest files for older ones
-            stats.skipped += fetches.length - i;
-            break;
+          // never empty the whole mirror for a file that cannot fit anyway; says nothing about the rest
+          funded = false;
+        } else if (free != null) {
+          funded = reserve <= free;
+        } else {
+          // make room first; whatever goes must be reported to the sink in the same step
+          final eviction = await _mirror.evictToFit(
+            account,
+            reserveBytes: reserve,
+            order: NextcloudEvictionOrder.oldestFirst,
+            funding: NextcloudSyncFunding(tier: tier, lastModified: item.lastModified),
+          );
+          if (!eviction.isEmpty) {
+            await _applyEviction(account, eviction, stats);
+            // the bound on the victims is what makes this unreachable: anything fetched earlier in this
+            // run ranks above this item, and a pass may only take what ranks below it
+            assert(!eviction.touched.any(fetchedThisRun.contains), 'the store evicted a row this run fetched: $eviction');
           }
+          final used = await _mirror.usedBytes(account);
+          funded = used + reserve <= account.cacheLimitBytes;
+          if (!funded) free = account.cacheLimitBytes - used;
         }
-        final used = await _mirror.usedBytes(account);
-        if (used + reserve > account.cacheLimitBytes) {
-          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes - used);
+        if (!funded) {
+          // The budget said no: the item is still listed, so it gets a row and an entry, streamed on
+          // demand, and the reason is recorded so a raised budget knows to come back for it. Not a quota
+          // failure, which it was: a failure ends the run with no row for a listed item, which withholds
+          // the etags and walks the whole tree again next run, for a file the budget still cannot hold.
+          await _recordPlaceholder(account, item, existing, stats, reason: NextcloudPlaceholderReason.unfunded);
+          fetchedThisRun.add(path);
+          done++;
+          emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
+          continue;
         }
 
         final localPath = _mirror.localPathFor(account, path);
@@ -446,7 +505,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           } on NextcloudPreviewUnavailableFailure {
             // the server cannot derive this one (HEIC and HEIF under the default providers): the item is
             // still listed, so it gets a placeholder row, which the completeness rule admits
-            await _recordPlaceholder(account, item, existing, stats);
+            await _recordPlaceholder(account, item, existing, stats, reason: NextcloudPlaceholderReason.policy);
             fetchedThisRun.add(path);
             done++;
             emit(NextcloudSyncProgress(phase: NextcloudSyncPhase.downloading, done: done, total: total, bytesDone: bytesDone));
@@ -485,8 +544,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           throw NextcloudLocalStorageFailure('could not create an entry for $path');
         }
         fetchedThisRun.add(path);
-        // accounted after the fetch, with the bytes that actually landed, not the reservation
-        fetchedBytes += localBytes;
+        // accounted after the fetch, with the bytes that landed as the store read them, not the reservation
+        if (free != null) free = account.cacheLimitBytes - await _mirror.usedBytes(account);
         if (existing == null) {
           stats.added++;
         } else {
@@ -504,7 +563,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
 
   // No bytes, so no budget, no eviction and no download: the row and the entry are all there is. A
   // placeholder the sink refuses is removed again, since a row with no entry would be skipped by etag forever.
-  Future<void> _recordPlaceholder(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing, _Stats stats) async {
+  Future<void> _recordPlaceholder(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing, _Stats stats, {required NextcloudPlaceholderReason reason}) async {
     final path = item.relativePath;
     await _mirror.record(
       account,
@@ -513,6 +572,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         etag: item.etag,
         fileId: item.fileId,
         tier: NextcloudMirrorTier.placeholder,
+        placeholderReason: reason,
         remoteSizeBytes: item.sizeBytes,
         localSizeBytes: 0,
         remoteLastModified: item.lastModified,
@@ -526,7 +586,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     }
     if (existing == null) {
       stats.added++;
-    } else {
+    } else if (existing.etag != item.etag || existing.tier != NextcloudMirrorTier.placeholder || existing.placeholderReason != reason) {
+      // a relist that finds the budget still says no writes the same row again; that is not an update
       stats.updated++;
     }
   }
@@ -575,27 +636,35 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     }
   }
 
+  // The end-of-run sweep: the sync's order, with no item to fund, so nothing is out of bounds. It has work
+  // only when the limit was lowered or pinned downloads grew past it, and this run's fetches are the newest
+  // rows, so they go last.
   Future<void> _evict(NextcloudAccount account, _Stats stats) async {
-    final eviction = await _mirror.evictToFit(account);
+    final eviction = await _mirror.evictToFit(account, order: NextcloudEvictionOrder.oldestFirst);
     if (eviction.isEmpty) return;
     await _applyEviction(account, eviction, stats);
   }
 
-  // Both eviction sites go through here so the two outcomes cannot be handled differently by accident.
-  //
-  // `demoted` is structurally empty until the view tier exists, which is why there is an `assert` and not
-  // a branch: the refresh a demoted entry needs (its bytes and its recorded dimensions both changed) is
-  // the leaf that introduces demotion to write, and an empty handler here would let that leaf ship a grid
-  // full of entries describing bytes that are no longer there.
-  //
-  // Read the `assert` as a development tripwire and not as a guarantee: it is compiled out of a release
-  // build, so a non-empty `demoted` would be dropped silently there. The leaf that fills the set must
-  // replace this line with the refresh rather than rely on it.
+  // Every eviction site goes through here so the two outcomes cannot be handled differently by accident.
   Future<void> _applyEviction(NextcloudAccount account, NextcloudEvictionOutcome eviction, _Stats stats) async {
-    assert(eviction.demoted.isEmpty, 'demoted rows need their entries refreshed, which is not implemented');
-    if (eviction.removed.isEmpty) return;
-    await _sink.removeMirroredFiles(account, eviction.removed);
-    stats.evicted += eviction.removed.length;
+    if (eviction.demoted.isNotEmpty) {
+      // the rows survive as unfunded placeholders: the entries stay, and the sink drops what described
+      // their bytes
+      await _sink.demoteToPlaceholders(account, eviction.demoted);
+      stats.demoted += eviction.demoted.length;
+    }
+    if (eviction.removed.isNotEmpty) {
+      await _sink.removeMirroredFiles(account, eviction.removed);
+      // `removed` only, never `demoted`, and the omission is the mechanism rather than an oversight. This
+      // counter is what forgets every stored etag at the end of the run (`_run`), because a row that left
+      // the mirror may sit under a subtree the run trusted and no server etag will ever point at it again.
+      // A demoted row has not left: the item is listed, held as a placeholder the completeness rule
+      // accepts, and found current by the next run, so nothing under any promised subtree is a lie.
+      // Count demotions here and every eviction puts the account back on the treadmill this was written to
+      // close — a full tree walk on every run, funding last run's gap by evicting last run's fetch —
+      // measured as `evicted=1` on every run after the first, with nothing changed on the server.
+      stats.evicted += eviction.removed.length;
+    }
   }
 
   // a process that died mid-download leaves `<path>.part` behind: not indexed, not evictable, never reused
@@ -658,7 +727,7 @@ class _Listing {
 }
 
 class _Stats {
-  int added = 0, updated = 0, removed = 0, skipped = 0, evicted = 0, lost = 0;
+  int added = 0, updated = 0, removed = 0, skipped = 0, evicted = 0, demoted = 0, lost = 0;
   final itemFailures = <String, NextcloudFailure>{};
 
   NextcloudSyncResult result({NextcloudFailure? fatal}) => NextcloudSyncResult(
@@ -667,6 +736,7 @@ class _Stats {
     removed: removed,
     skipped: skipped,
     evicted: evicted,
+    demoted: demoted,
     lost: lost,
     itemFailures: Map.unmodifiable(itemFailures),
     fatal: fatal,

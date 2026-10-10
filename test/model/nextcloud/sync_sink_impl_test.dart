@@ -480,6 +480,47 @@ void main() {
       expect(inserted.hasGps, isFalse);
     });
   });
+
+  group('demoteToPlaceholders', () {
+    test('an entry whose bytes the budget took back stays, with its id and its row, and is told its look changed', () async {
+      db.rows[1] = row(localA, id: 1);
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      final entry = source.getEntryById(1)!;
+      var visualChanges = 0;
+      entry.visualChangeNotifier.addListener(() => visualChanges++);
+      // loading the source writes to the DB on its own; only what the demotion adds is the question
+      final removalsBefore = db.removals.length, updatesBefore = db.updates.length;
+
+      await sink.demoteToPlaceholders(account, {relA});
+
+      // the whole point of demotion over removal: the photo is still in the gallery, with everything it had
+      expect(source.getEntryById(1), same(entry));
+      expect(inCollection(uriA).map((e) => e.id), [1]);
+      expect(db.rows.keys, {1}, reason: 'the row is untouched: nothing the server could say beats what the device read');
+      expect(db.removals.length, removalsBefore);
+      expect(db.updates.length, updatesBefore);
+      // but the tile and the viewer must look again, since the bytes they decoded are gone
+      expect(visualChanges, 1);
+      // never consulted: there are no new bytes to read
+      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+    });
+
+    test('a path with no entry in the loaded collection is skipped, not an error', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      // a row the source did not load, and a path with no row at all
+      db.rows[7] = row(localA, id: 7);
+
+      final removalsBefore = db.removals.length, updatesBefore = db.updates.length;
+
+      await sink.demoteToPlaceholders(account, {relA, relB});
+
+      expect(db.rows.keys, {7});
+      expect(db.removals.length, removalsBefore);
+      expect(db.updates.length, updatesBefore);
+    });
+  });
 }
 
 // A stand-in for the leaf that will synthesise entries without local bytes.

@@ -57,6 +57,17 @@ void main() {
     return useCase.lastResult;
   }
 
+  // what is actually under the account's mirror root, which is what `usedBytes` claims to report
+  Future<int> bytesOnDisk(NextcloudAccount account) async {
+    final dir = Directory(mirror.localPathFor(account, ''));
+    if (!await dir.exists()) return 0;
+    var total = 0;
+    await for (final entity in dir.list(recursive: true)) {
+      if (entity is File) total += await entity.length();
+    }
+    return total;
+  }
+
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('aves_nextcloud_sync');
     mirror = FakeNextcloudMirrorStore(tempDir.path);
@@ -555,6 +566,130 @@ void main() {
       expect(result.demoted, 0);
       expect(mirror.rows(account)['v2.mp4']?.tier, NextcloudMirrorTier.original);
       expect(await mirror.usedBytes(account), 6);
+    });
+
+    test('a changed file the budget cannot fund over its own bytes gives them back, and the sink is told', () async {
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [
+          fakeFile('v1.mp4', modified: day3, fileId: 1),
+          fakeFile('v2.mp4', modified: day2, fileId: 2),
+          fakeFile('v3.mp4', modified: day1, fileId: 3),
+        ],
+      );
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 6);
+      await sync(useCase, account: account);
+      expect(await mirror.usedBytes(account), 6);
+      expect(mirror.rows(account)['v3.mp4']?.placeholderReason, NextcloudPlaceholderReason.unfunded);
+
+      // `v2` grows on the server at the same mtime: nothing older than it is held (`v3` is already an
+      // unfunded placeholder), so its own pass has no candidate and the budget says no to a row with bytes
+      server.collections[''] = 'root-v2';
+      server.files['v2.mp4'] = fakeFile('v2.mp4', etag: 'v2', modified: day2, fileId: 2, size: 6);
+      final result = await sync(useCase, account: account);
+
+      expect(server.downloads, ['v1.mp4', 'v2.mp4'], reason: 'nothing was fetched for a file the budget cannot hold');
+      final row = mirror.rows(account)['v2.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.placeholder);
+      expect(row.placeholderReason, NextcloudPlaceholderReason.unfunded);
+      expect(row.etag, 'v2', reason: 'the new etag, or the subtree would be withheld and re-listed every run');
+      expect(row.localSizeBytes, 0);
+      // the old bytes went back to the budget rather than staying on disk under a row that claims none
+      expect(await mirror.usedBytes(account), 3);
+      expect(await bytesOnDisk(account), 3, reason: 'the accounting and the disk agree');
+      // the entry exists and its bytes are gone: a demotion, not a new placeholder
+      expect(sink.demoted, {'v2.mp4'});
+      expect(sink.placeholders, ['v3.mp4'], reason: 'run 1 asked for v3; nothing in this run asked for a placeholder');
+      expect(result.demoted, 1);
+      expect(result.updated, 0);
+      expect(mirror.rows(account)['v1.mp4']?.tier, NextcloudMirrorTier.original);
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v2'), reason: 'the mirror reflects the server, so the subtree is promised');
+    });
+
+    test('a file that grows past the whole budget is refused before anything is demoted for it', () async {
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [fakeFile('v1.mp4', modified: day3, fileId: 1, size: 6)],
+      );
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 6);
+      await sync(useCase, account: account);
+      expect(mirror.rows(account)['v1.mp4']?.tier, NextcloudMirrorTier.original);
+
+      // the file grows past the budget and its mtime moves, so its own row is inside the bound of its own
+      // pass and is the only candidate there is; the netted reservation (3) would have fit
+      server.collections[''] = 'root-v2';
+      server.files['v1.mp4'] = fakeFile('v1.mp4', etag: 'v2', modified: DateTime.utc(2026, 10, 4), fileId: 1, size: 9);
+      final result = await sync(useCase, account: account);
+
+      expect(server.downloads, ['v1.mp4'], reason: 'a body the mirror cannot hold is not downloaded only to be thrown away');
+      final row = mirror.rows(account)['v1.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.placeholder);
+      expect(row.placeholderReason, NextcloudPlaceholderReason.unfunded);
+      expect(row.etag, 'v2');
+      expect(await mirror.usedBytes(account), 0);
+      expect(await bytesOnDisk(account), 0);
+      expect(sink.demotions, [
+        {'v1.mp4'},
+      ], reason: 'told once, by the refusal, not again by the sweep');
+      expect(result.demoted, 1);
+      expect(result.itemFailures, isEmpty);
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v2'));
+    });
+
+    test('a pinned original the budget cannot refresh keeps its bytes and its pin, and the refusal stays loud', () async {
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [fakeFile('v1.mp4', modified: day3, fileId: 1, size: 6)],
+      );
+      final useCase = useCaseWith(server);
+      final account = accountWith(cacheLimitBytes: 6);
+      await sync(useCase, account: account);
+      mirror.rows(account)['v1.mp4'] = mirror.rows(account)['v1.mp4']!.copyWith(pinned: true);
+
+      server.collections[''] = 'root-v2';
+      server.files['v1.mp4'] = fakeFile('v1.mp4', etag: 'v2', modified: DateTime.utc(2026, 10, 4), fileId: 1, size: 9);
+      final result = await sync(useCase, account: account);
+
+      // the user asked for these bytes: a change the budget cannot fund is not a reason to take them
+      expect(result.itemFailures['v1.mp4'], isA<NextcloudQuotaFailure>());
+      final row = mirror.rows(account)['v1.mp4']!;
+      expect(row.tier, NextcloudMirrorTier.original);
+      expect(row.pinned, isTrue);
+      expect(row.etag, 'v1', reason: 'the row still describes the bytes it holds');
+      expect(await mirror.usedBytes(account), 6);
+      expect(await bytesOnDisk(account), 6);
+      expect(sink.demoted, isEmpty);
+      expect(server.downloads, ['v1.mp4']);
+      expect(states.states['acc1']?.collectionEtags, isNot(containsPair('', 'root-v2')), reason: 'a stale pinned row is a gap the next run must see');
+    });
+
+    test('an image that changed and can no longer be rendered gives back its grid bytes', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase);
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.grid);
+      final held = await mirror.usedBytes(accountWith());
+      final gridBytes = mirror.rows(accountWith())['a.jpg']!.localSizeBytes;
+      expect(gridBytes, greaterThan(0));
+
+      // the same policy placeholder a never-rendered image gets, but written over a row with bytes
+      server.collections[''] = 'root-v2';
+      server.files['a.jpg'] = fakeFile('a.jpg', etag: 'v2', modified: day1, fileId: 1);
+      server.previewFailures['a.jpg'] = const NextcloudPreviewUnavailableFailure('a.jpg');
+      final result = await sync(useCase);
+
+      final row = mirror.rows(accountWith())['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.placeholder);
+      expect(row.placeholderReason, NextcloudPlaceholderReason.policy);
+      expect(row.etag, 'v2');
+      expect(await mirror.usedBytes(accountWith()), held - gridBytes);
+      expect(await bytesOnDisk(accountWith()), held - gridBytes);
+      expect(sink.demoted, {'a.jpg'});
+      expect(sink.placeholders, isEmpty, reason: '`putPlaceholder` would read the file it no longer has and drop the entry');
+      expect(result.demoted, 1);
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v2'));
     });
   });
 

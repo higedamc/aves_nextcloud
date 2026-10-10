@@ -222,9 +222,15 @@ abstract class NextcloudMirrorStore {
   // the file they are, how large the original is, or whether anyone asked for it.
   //
   // A `NextcloudMirrorTier.placeholder` row is the one exception and takes a separate branch: there is no
-  // file to stat, so nothing is read back and `localSizeBytes` is written as 0. Any other tier without its
-  // bytes on disk is a `NextcloudNotFoundFailure`, because recording a row for a file that is not there
-  // would make `usedBytes` lie forever.
+  // file to stat, so nothing is read back and `localSizeBytes` is written as 0 — and **any file at the path
+  // is deleted first**. A placeholder is the tier whose file is absent by design, and the store is what
+  // makes that so: written over a row that holds bytes (a changed file the budget cannot fund, or that the
+  // server can no longer derive), the bytes go back to the budget; left on disk under a zero-byte row they
+  // would be counted by nothing and found by no later run. A caller writing a placeholder over such a row
+  // MUST tell the sink the entry's bytes are gone (`NextcloudSyncSink.demoteToPlaceholders`), exactly as it
+  // does for `evictToFit`'s `demoted`. Any other tier without its bytes on disk is a
+  // `NextcloudNotFoundFailure`, because recording a row for a file that is not there would make `usedBytes`
+  // lie forever.
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry);
 
   // deletes the file and its index row; a no-op for unknown paths

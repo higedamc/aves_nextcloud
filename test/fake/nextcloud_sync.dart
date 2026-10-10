@@ -265,9 +265,12 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
 
   @override
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry) async {
-    // same branch as the real store: a placeholder has no file to stat and no bytes to count
+    // same branch as the real store: a placeholder has no file to stat and no bytes to count, and any file
+    // already at the path goes back to the budget
     final isPlaceholder = entry.tier == NextcloudMirrorTier.placeholder;
-    final stat = isPlaceholder ? null : await File(localPathFor(account, entry.relativePath)).stat();
+    final file = File(localPathFor(account, entry.relativePath));
+    if (isPlaceholder && await file.exists()) await file.delete();
+    final stat = isPlaceholder ? null : await file.stat();
     if (stat != null && stat.type != FileSystemEntityType.file) throw NextcloudNotFoundFailure(entry.relativePath);
     rows(account)[entry.relativePath] = NextcloudMirrorIndexEntry(
       relativePath: entry.relativePath,

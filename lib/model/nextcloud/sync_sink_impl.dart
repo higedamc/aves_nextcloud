@@ -145,6 +145,12 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   // It decides one thing, and the row loss it prevents is the reason this parameter exists rather than a
   // `File.exists` probe: see the existing-entry branch below.
   Future<bool> _putEntry(String uri, AvesEntry fetched, {CatalogMetadata? presetCatalog, required bool hasLocalBytes}) async {
+    // A put with no bytes must bring its own catalogue: there is no file for the device cataloguer to read,
+    // so a null `presetCatalog` would leave the entry with no date and no GPS from any source, and queue it
+    // for cataloguing a file that does not exist. The no-bytes branch below also leans on this — setting
+    // `catalogMetadata` is what drops the derived `bestDate`/`bestTitle`/`tags` caches, which is the job
+    // `AvesEntry.refresh` does at its top and `applyNewFields` does not do at all.
+    assert(hasLocalBytes || presetCatalog != null);
     final index = await _idByUri;
     final id = index[uri];
     if (id != null) {

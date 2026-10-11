@@ -47,7 +47,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   static const batchSize = 100;
   static const flushDelay = Duration(seconds: 2);
 
-  new(this._source, this._mirror, {this._placeholders = const UnimplementedNextcloudPlaceholderEntries()}) {
+  new(this._source, this._mirror, {this._placeholders = const NextcloudPlaceholderEntriesImpl()}) {
     _subscriptions.add(_source.eventBus.on<EntryRemovedEvent>().listen(_onEntriesRemoved));
   }
 
@@ -98,7 +98,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
     // entry already `isCatalogued`, which is what `TagMixin.catalogEntriesTest` reads to decide whether
     // `analyze()` still has work to do for it. `original` keeps today's behaviour unchanged.
     final presetCatalog = tier == NextcloudMirrorTier.original ? null : catalogMetadataFromPhotoMetadata(fetched.id, item.photoMetadata);
-    return _putEntry(uri, fetched, presetCatalog: presetCatalog);
+    return _putEntry(uri, fetched, presetCatalog: presetCatalog, hasLocalBytes: true);
   }
 
   @override
@@ -126,6 +126,8 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
       uri,
       synthesised.copyWith(uri: uri, path: localPath),
       presetCatalog: presetCatalog,
+      // there is no file at `localPath`, and that is the whole point of this put; see `_putEntry`
+      hasLocalBytes: false,
     );
   }
 
@@ -136,7 +138,19 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   // keeps the device-side cataloguer as the sole source, as before). It is applied *instead of* the forced
   // re-catalog below, not alongside it: the local bytes behind a preview-tier entry have no Exif, so forcing
   // `entry.catalog()` on them would wipe exactly what the caller just supplied with nothing to replace it.
-  Future<bool> _putEntry(String uri, AvesEntry fetched, {CatalogMetadata? presetCatalog}) async {
+  //
+  // `hasLocalBytes` says whether there is a file at this URI for the caller's entry to have come from. It
+  // is a fact at both call sites rather than a guess: `putMirroredFile` only gets here once
+  // `mediaFetchService.getEntry` has read the file, and `putPlaceholder` is defined by there being no file.
+  // It decides one thing, and the row loss it prevents is the reason this parameter exists rather than a
+  // `File.exists` probe: see the existing-entry branch below.
+  Future<bool> _putEntry(String uri, AvesEntry fetched, {CatalogMetadata? presetCatalog, required bool hasLocalBytes}) async {
+    // A put with no bytes must bring its own catalogue: there is no file for the device cataloguer to read,
+    // so a null `presetCatalog` would leave the entry with no date and no GPS from any source, and queue it
+    // for cataloguing a file that does not exist. The no-bytes branch below also leans on this — setting
+    // `catalogMetadata` is what drops the derived `bestDate`/`bestTitle`/`tags` caches, which is the job
+    // `AvesEntry.refresh` does at its top and `applyNewFields` does not do at all.
+    assert(hasLocalBytes || presetCatalog != null);
     final index = await _idByUri;
     final id = index[uri];
     if (id != null) {
@@ -148,16 +162,34 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
           existing.catalogMetadata = presetCatalog.copyWith(id: existing.id);
           await localMediaDb.updateCatalogMetadata(existing.id, existing.catalogMetadata);
         }
-        // same path, new bytes: refresh in place, so the entry keeps its id, favourite and cover
-        await _source.refreshEntries(
-          {existing},
-          {
-            EntryDataType.basic,
-            EntryDataType.aspectRatio,
-            EntryDataType.address,
-            if (presetCatalog == null) EntryDataType.catalog,
-          },
-        );
+        if (hasLocalBytes) {
+          // same path, new bytes: refresh in place, so the entry keeps its id, favourite and cover
+          await _source.refreshEntries(
+            {existing},
+            {
+              EntryDataType.basic,
+              EntryDataType.aspectRatio,
+              EntryDataType.address,
+              if (presetCatalog == null) EntryDataType.catalog,
+            },
+          );
+        } else {
+          // Same path, still no bytes: a placeholder put over an entry that is already one (a `force` run
+          // re-puts every placeholder, a relist after a raised limit re-puts the ones still unfunded, and
+          // an etag change re-puts that one). `EntryDataType.basic` must not be asked for here, because a
+          // refresh *drops the row first* (`AvesEntry.refresh` -> `localMediaDb.removeIds`) and writes it
+          // back only from the file it then reads: with no file there is nothing to write back, so the row
+          // is gone while the entry survives in memory. That reads as "the photo disappeared after a
+          // restart", and the subtree is etag-trusted, so no later sync relists it. `demoteToGrid` avoids
+          // the same edge by checking the file exists; here the caller already knows.
+          //
+          // So the synthesised fields are applied to the entry and its row directly -- `applyNewFields`
+          // persists with `updateEntry`, which is an update and not a delete -- and the rest of the
+          // refresh is still asked for, since what changed between two placeholder puts (the server's
+          // dimensions, its modification date, its GPS) is exactly what those steps publish.
+          await existing.applyNewFields(fetched.toDatabaseMap(), persist: true);
+          await _source.refreshEntries({existing}, {EntryDataType.aspectRatio, EntryDataType.address});
+        }
         // New bytes at the same path, by definition of a put over an existing entry: the images decoded
         // from the old ones must go. `refresh` only notices a visual change through the file date, and a
         // derivative fetched for the same server version (the view tier over the grid tier) keeps it.

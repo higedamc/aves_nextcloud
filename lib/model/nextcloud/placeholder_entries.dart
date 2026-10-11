@@ -12,26 +12,17 @@ import 'package:aves/model/nextcloud/remote_item.dart';
 //
 // Keeping it here keeps two leaves orthogonal: the sink (which owns cataloguing from properties) delegates
 // to this interface and never needs to know how a path-less entry is made, while the leaf that adds video
-// placeholders and streaming playback fills this file in without touching the sink.
+// placeholders and streaming playback owns this file without touching the sink.
+//
+// An implementation must be total over the items the sync hands it: it reports "no entry for this one" by
+// returning null, and must not throw. A throw from here is not a `NextcloudFailure`, so the per-item
+// `on NextcloudFailure catch` in `NextcloudSyncUseCaseImpl._run` does not catch it, and one unmirrorable
+// item would abort the run for the whole account with no etags saved. That is measured, not hypothetical:
+// the Phase 0 stub that threw did exactly this on a 1.27 GB mp4 on 2026-10-11.
 abstract class NextcloudPlaceholderEntries {
   // `null` when no entry can be made for this item, which the sink reports as a refusal rather than a
   // failure: an item with no obtainable derivative is a normal outcome, not an error.
   AvesEntry? build(NextcloudAccount account, NextcloudRemoteItem item);
-}
-
-// Phase 0 placeholder for the implementation. Nothing creates placeholder rows yet, so this is unreachable;
-// it throws rather than returning null so that the first caller gets a loud, locatable failure instead of
-// silently losing every item it was supposed to show.
-//
-// Retired by the commit that wires `NextcloudPlaceholderEntriesImpl` into the sink's default. It is kept
-// until then because the sink's constructor default still names it, and that file belongs to another leaf.
-class UnimplementedNextcloudPlaceholderEntries implements NextcloudPlaceholderEntries {
-  const new();
-
-  @override
-  AvesEntry? build(NextcloudAccount account, NextcloudRemoteItem item) {
-    throw UnimplementedError('synthesising an entry without local bytes is not implemented yet');
-  }
 }
 
 // The entry for a listed media item with no local bytes, built from the WebDAV properties alone.

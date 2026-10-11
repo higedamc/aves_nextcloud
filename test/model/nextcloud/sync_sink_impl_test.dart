@@ -104,11 +104,14 @@ void main() {
   final localA = mirror.localPathFor(account, relA), localB = mirror.localPathFor(account, relB);
   final uriA = Uri.file(localA).toString(), uriB = Uri.file(localB).toString();
 
-  NextcloudRemoteItem itemFor(String relativePath, {NextcloudPhotoMetadata? photoMetadata}) => NextcloudRemoteItem(
+  // `mimeType` is overridable because one test needs an item the real builder refuses: `sourceMimeType`
+  // is non-nullable on an entry and every downstream decision reads it, so an item without a server
+  // content type cannot be given one from anywhere else.
+  NextcloudRemoteItem itemFor(String relativePath, {NextcloudPhotoMetadata? photoMetadata, String? mimeType = MimeTypes.jpeg}) => NextcloudRemoteItem(
     relativePath: relativePath,
     fileId: null,
     etag: 'e-$relativePath',
-    mimeType: MimeTypes.jpeg,
+    mimeType: mimeType,
     sizeBytes: 42,
     lastModified: DateTime.utc(2024),
     isCollection: false,
@@ -437,12 +440,47 @@ void main() {
       expect(inCollection(Uri.file(localA).toString()), isEmpty);
     });
 
-    test('the default builder is unimplemented and says so loudly', () async {
+    // The default is what production gets: `Nextcloud._doInit` builds the sink without naming a builder.
+    // Both tests below are about the default specifically, not about the builder's own behaviour (that is
+    // `placeholder_entries_test.dart`), because the defect they pin lived in the wiring: the Phase 0 stub
+    // was still the default after the video threshold and the `PreviewUnavailable` route made placeholders
+    // reachable, so a real account could not sync at all.
+    test('the default builder synthesises the entry from the server properties', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      final serverMetadata = NextcloudPhotoMetadata(
+        width: 4032,
+        height: 3024,
+        originalDateTime: DateTime.utc(2023, 5, 6, 12),
+        latitude: null,
+        longitude: null,
+      );
+
+      expect(await sink.putPlaceholder(account, itemFor(relA, photoMetadata: serverMetadata)), isTrue);
+
+      final inserted = db.inserts.single.single;
+      expect(inserted.uri, Uri.file(localA).toString());
+      expect(inserted.path, localA);
+      expect(inserted.sourceMimeType, MimeTypes.jpeg);
+      expect(inserted.width, 4032);
+      expect(inserted.height, 3024);
+      // the original's size on the server, since nothing is held locally
+      expect(inserted.sizeBytes, 42);
+      expect(inserted.sourceDateTakenMillis, DateTime.utc(2023, 5, 6, 12).millisecondsSinceEpoch);
+      // never consulted: there are no bytes to read
+      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+    });
+
+    test('an item the default builder cannot make an entry for is a refusal, not a thrown error', () async {
       source = await initSource();
       sink = NextcloudCollectionSyncSink(source, mirror);
 
-      // nothing creates placeholder rows yet; a silent null here would lose every item it was meant to show
-      await expectLater(sink.putPlaceholder(account, itemFor(relA)), throwsUnimplementedError);
+      // A throw here is not a `NextcloudFailure`, so the per-item `on NextcloudFailure catch` in
+      // `NextcloudSyncUseCaseImpl._run` would not catch it: one such item would abort the run for the
+      // whole account and save no etags. The refusal keeps the loss to this one item.
+      expect(await sink.putPlaceholder(account, itemFor(relA, mimeType: null)), isFalse);
+      expect(db.inserts, isEmpty);
+      expect(inCollection(Uri.file(localA).toString()), isEmpty);
     });
 
     test('a placeholder is catalogued from the server metadata, since there are no bytes for the device to read', () async {

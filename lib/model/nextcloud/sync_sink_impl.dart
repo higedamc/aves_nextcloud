@@ -47,7 +47,7 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
   static const batchSize = 100;
   static const flushDelay = Duration(seconds: 2);
 
-  new(this._source, this._mirror, {this._placeholders = const UnimplementedNextcloudPlaceholderEntries()}) {
+  new(this._source, this._mirror, {this._placeholders = const NextcloudPlaceholderEntriesImpl()}) {
     _subscriptions.add(_source.eventBus.on<EntryRemovedEvent>().listen(_onEntriesRemoved));
   }
 

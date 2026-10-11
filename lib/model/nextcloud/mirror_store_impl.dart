@@ -322,6 +322,16 @@ class NextcloudMirrorStoreImpl implements NextcloudMirrorStore {
     await _index.put(account, victim.asUnfundedPlaceholder());
   }
 
+  @override
+  Future<void> demoteToGrid(NextcloudAccount account, String relativePath) async {
+    final normalized = _requireNormalized(relativePath);
+    final existing = await _index.get(account, normalized);
+    // no grid bytes to go back to: nothing is written, see the contract
+    if (existing == null || existing.tier != NextcloudMirrorTier.view) throw NextcloudNotFoundFailure(normalized);
+    if (!await File(sidecarPathFor(account, normalized)).exists()) throw NextcloudNotFoundFailure(normalized);
+    await _demoteToGrid(account, existing);
+  }
+
   // The transition for a view row: the view bytes go, the sidecar takes their place, and the row becomes a
   // grid row with the size read back from disk. File first, for the same reason as `_demote`: a crash after
   // the delete leaves a cache miss the next sync refills at grid, and `record` at grid drops the sidecar.

@@ -392,6 +392,17 @@ abstract class NextcloudMirrorStore {
     NextcloudSyncFunding? funding,
   });
 
+  // The transition `evictToFit`'s `demotedToGrid` makes, for one row, on request: the view bytes go, the
+  // sidecar takes their place, and the row is written back as a `grid` row with the size read from disk.
+  // For the caller whose view bytes turned out to be no good after `record` — the sink could not read an
+  // entry from them — and that must leave the row as the sync funded it rather than drop it: a row removed
+  // outside a run is refilled by nothing, since no etag was withheld and the next run trusts the subtree.
+  // The caller MUST tell the sink (`NextcloudSyncSink.demoteToGrid`), exactly as for `demotedToGrid`.
+  // A `NextcloudNotFoundFailure` when there is no `view` row for the path or its sidecar is not on disk:
+  // there are no grid bytes to go back to, and a row claiming bytes that are not there is the one thing
+  // the store never writes.
+  Future<void> demoteToGrid(NextcloudAccount account, String relativePath);
+
   // Deletes every sidecar of the account whose row is not a `view` row: a process that died between the
   // sidecar rename and the row write leaves one behind, and the row it belongs to is then refilled at grid
   // by the next sync (`record` at grid drops the sidecar) or never — this is for the latter.

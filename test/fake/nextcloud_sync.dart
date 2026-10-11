@@ -407,9 +407,7 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       final file = File(localPathFor(account, path));
       final sidecar = File(sidecarPathFor(account, path));
       if (victim.tier == NextcloudMirrorTier.view && await sidecar.exists()) {
-        await _deleteIfExists(file.path);
-        await sidecar.rename(file.path);
-        rows(account)[path] = victim.asGrid(localSizeBytes: await file.length());
+        await _demoteToGrid(account, victim);
         demotedToGrid.add(path);
         if (budgetClass == NextcloudBudgetClass.view) used -= victim.viewClassBytes;
       } else {
@@ -422,6 +420,23 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       }
     }
     return NextcloudEvictionOutcome(demoted: demoted, demotedToGrid: demotedToGrid);
+  }
+
+  Future<void> _demoteToGrid(NextcloudAccount account, NextcloudMirrorIndexEntry victim) async {
+    final path = victim.relativePath;
+    final file = File(localPathFor(account, path));
+    await _deleteIfExists(file.path);
+    await File(sidecarPathFor(account, path)).rename(file.path);
+    rows(account)[path] = victim.asGrid(localSizeBytes: await file.length());
+  }
+
+  @override
+  Future<void> demoteToGrid(NextcloudAccount account, String relativePath) async {
+    // same refusal as the real store: no view row, or no sidecar, is nothing to go back to
+    final existing = rows(account)[relativePath];
+    if (existing == null || existing.tier != NextcloudMirrorTier.view) throw NextcloudNotFoundFailure(relativePath);
+    if (!await File(sidecarPathFor(account, relativePath)).exists()) throw NextcloudNotFoundFailure(relativePath);
+    await _demoteToGrid(account, existing);
   }
 
   @override

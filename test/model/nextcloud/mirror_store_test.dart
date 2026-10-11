@@ -524,6 +524,27 @@ void main() {
       expect(await store.freeBytes(account, NextcloudBudgetClass.view), 60);
     });
 
+    test('demoteToGrid makes the view order\'s transition for one row on request, and refuses when there are no grid bytes to go back to', () async {
+      final account = accountWith(cacheLimitBytes: 1000, viewAllowanceBytes: 60);
+      await recordView(account, 'a.jpg', viewBytes: 30, gridBytes: 4);
+      await recordView(account, 'b.jpg', viewBytes: 30, gridBytes: 4);
+      await recordWritten(account, 'c.jpg', 10, tier: NextcloudMirrorTier.grid);
+
+      await store.demoteToGrid(account, 'a.jpg');
+
+      await expectGrid(account, 'a.jpg', gridBytes: 4);
+      expect((await store.lookup(account, 'b.jpg'))!.tier, NextcloudMirrorTier.view, reason: 'one row, the one asked for');
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.view), 30);
+
+      // a grid row, an unknown path, a view row whose sidecar is gone: nothing to put in the view bytes' place
+      await expectLater(store.demoteToGrid(account, 'c.jpg'), throwsA(isA<NextcloudNotFoundFailure>()));
+      await expectLater(store.demoteToGrid(account, 'never.jpg'), throwsA(isA<NextcloudNotFoundFailure>()));
+      await File(store.sidecarPathFor(account, 'b.jpg')).delete();
+      await expectLater(store.demoteToGrid(account, 'b.jpg'), throwsA(isA<NextcloudNotFoundFailure>()));
+      expect((await store.lookup(account, 'b.jpg'))!.tier, NextcloudMirrorTier.view, reason: 'refused before anything is written');
+      expect(await File(store.localPathFor(account, 'b.jpg')).length(), 30, reason: 'the view bytes stay: deleted with no grid bytes to put back, the row would claim a file that is not there');
+    });
+
     test('a sync order reaching a view row takes its grid bytes at the row\'s own place in the order, not after the newer rows on the page', () async {
       // the sync budget is `cacheLimitBytes` here (allowance 0); the view row sits in it as its 4 sidecar bytes
       final account = accountWith(cacheLimitBytes: 10, viewAllowanceBytes: 0);

@@ -46,7 +46,8 @@ abstract class NextcloudSyncSink {
   Future<void> demoteToPlaceholders(NextcloudAccount account, Set<String> relativePaths);
 
   // The view bytes behind these entries were given back to the allowance and their grid bytes are in
-  // place again (`NextcloudMirrorStore.evictToFit`'s `demotedToGrid`). The entries stay, and are read
+  // place again (`NextcloudMirrorStore.evictToFit`'s `demotedToGrid`, or `NextcloudMirrorStore.demoteToGrid`
+  // after an open whose view bytes this sink could not read). The entries stay, and are read
   // again from the grid bytes for what the bytes decide — size and dimensions — and nothing else: the
   // catalogue came from the server's properties (a derivative carries no Exif) and must survive. The
   // cached images for the URI are dropped and a visual change announced, so the tile and the viewer

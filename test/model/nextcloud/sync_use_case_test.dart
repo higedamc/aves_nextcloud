@@ -1170,6 +1170,43 @@ void main() {
       expect(sink.demoted, isEmpty);
     });
 
+    test('a view the sink cannot read goes back to the grid row the open started from, which no sync would refill', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 3);
+      final useCase = await synced(server, account);
+      final syncBytes = await mirror.usedBytes(account, of: NextcloudBudgetClass.sync);
+      final enumerations = server.enumerations;
+      sink.putFails.add('a.jpg');
+
+      final failure = await open(useCase, account, 'a.jpg', server: server);
+
+      expect(failure, isA<NextcloudLocalStorageFailure>());
+      // The row the sync funded is what is left, never no row: an open withholds no etag, so a row removed
+      // here would sit under a subtree every later run trusts, and nothing would ever list it again.
+      final row = mirror.rows(account)['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.grid);
+      expect(row.localSizeBytes, 2);
+      expect(row.sidecarSizeBytes, 0);
+      expect(await File(mirror.localPathFor(account, 'a.jpg')).length(), 2, reason: 'the grid bytes, back from the sidecar');
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(sink.demotedToGrid, {'a.jpg'}, reason: 'the entry re-reads the grid bytes it describes');
+      expect(sink.demoted, isEmpty);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.sync), syncBytes);
+
+      // the next run, with nothing changed on the server, takes the fast path past the row and has nothing to do
+      final fetchedBefore = server.fetched.length;
+      await sync(useCase, account: account);
+      expect(server.enumerations, enumerations, reason: 'no etag was withheld: the subtree is still promised');
+      expect(server.fetched.length, fetchedBefore);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.grid);
+
+      // and the next open is the first one over again
+      sink.putFails.clear();
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.view);
+    });
+
     test('a full allowance gives up the least recently opened view row, back to its grid bytes, and never a sync-held row', () async {
       final server = serverWith(
         collections: {'': 'root-v1'},

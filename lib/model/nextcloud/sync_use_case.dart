@@ -234,8 +234,16 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           ),
         );
         if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.view)) {
-          // the entry could not be read from the new bytes: drop them so the next sync refills the row at grid
-          await _mirror.remove(account, path);
+          // The entry could not be read from the new bytes (undecodable, or any platform failure: the fetch
+          // service answers `null` to either). Back to the grid row the open started from — the view bytes
+          // go, the sidecar takes their place — and never `remove`: a row removed here is refilled by
+          // nothing. `_download` may drop a row because a failing item withholds its collection's etag, so
+          // the next run lists it again; an open is outside a run, withholds nothing, and the stored etag
+          // still matches the server's, so every later run takes the unchanged-subtree fast path past the
+          // gap. The entry still describes the grid bytes, which are in place again; the sink re-reads
+          // them, as it does for a demotion the allowance made.
+          await _mirror.demoteToGrid(account, path);
+          await _sink.demoteToGrid(account, {path});
           throw NextcloudLocalStorageFailure('could not refresh the entry for $path');
         }
         return null;

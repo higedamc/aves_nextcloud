@@ -50,7 +50,14 @@ abstract class NextcloudPlaceholderEntries {
 // `dateModifiedMillis` so the entry sorts by when the file was written rather than when it was seen, and
 // the capture date comes from `nc:metadata-photos-original_date_time` when the server has it. Both are
 // **null when unknown, never 0** — a zero reads back as 1970 and sorts the item to the start of the
-// library, which looks like data loss rather than a missing property.
+// library, which looks like data loss rather than a missing property. `NextcloudRemoteItem.lastModified`
+// is not nullable, and `MultistatusParser` answers the epoch for a header it cannot read, so "unknown"
+// arrives here as 0 and is turned back into null below.
+//
+// Every number here is the server's claim about a file this device has never read, and this is the first
+// entry in the source whose shape comes from a claim rather than from bytes a decoder measured. So the two
+// fields the UI divides by are taken only when they are usable: `displayAspectRatio` guards `== 0` alone,
+// and a negative width reaches `AspectRatio` in the viewer, which asserts a positive ratio.
 class NextcloudPlaceholderEntriesImpl implements NextcloudPlaceholderEntries {
   const new();
 
@@ -63,6 +70,12 @@ class NextcloudPlaceholderEntriesImpl implements NextcloudPlaceholderEntries {
     if (item.isCollection || mimeType == null || !item.isMedia) return null;
 
     final photo = item.photoMetadata;
+    // both or neither: one usable side is not an aspect ratio, and 0 is what `displayAspectRatio` reads
+    // as unknown (it answers 1, so the tile is square instead of dividing by zero or going negative)
+    final width = photo?.width, height = photo?.height;
+    final sized = width != null && height != null && width > 0 && height > 0;
+    // the parser's "unknown" for a date it could not read; 1970 is not a date this item has
+    final modifiedMillis = item.lastModified.millisecondsSinceEpoch;
     return AvesEntry(
       id: null,
       uri: '',
@@ -70,11 +83,9 @@ class NextcloudPlaceholderEntriesImpl implements NextcloudPlaceholderEntries {
       contentId: null,
       pageId: null,
       sourceMimeType: mimeType,
-      // 0 means unknown to `displayAspectRatio`, which answers 1 for it, so an unsized tile is square
-      // rather than a division by zero. The server gives real dimensions only for items it could
-      // extract them from.
-      width: photo?.width ?? 0,
-      height: photo?.height ?? 0,
+      // the server gives real dimensions only for items it could extract them from
+      width: sized ? width : 0,
+      height: sized ? height : 0,
       sourceRotationDegrees: 0,
       // the original's size on the server, which is what an info page should show; nothing is held locally
       sizeBytes: item.sizeBytes,
@@ -83,7 +94,7 @@ class NextcloudPlaceholderEntriesImpl implements NextcloudPlaceholderEntries {
       sourceTitle: null,
       // when it was added to *this device*, which is not something the server knows
       dateAddedSecs: null,
-      dateModifiedMillis: item.lastModified.millisecondsSinceEpoch,
+      dateModifiedMillis: modifiedMillis == 0 ? null : modifiedMillis,
       sourceDateTakenMillis: photo?.originalDateTime?.millisecondsSinceEpoch,
       durationMillis: null,
       trashed: false,

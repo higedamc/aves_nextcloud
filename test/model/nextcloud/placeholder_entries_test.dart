@@ -25,13 +25,14 @@ void main() {
     int sizeBytes = 900 * 1024 * 1024,
     bool isCollection = false,
     NextcloudPhotoMetadata? photoMetadata,
+    DateTime? lastModified,
   }) => NextcloudRemoteItem(
     relativePath: relativePath,
     fileId: 42,
     etag: 'v1',
     mimeType: mimeType,
     sizeBytes: sizeBytes,
-    lastModified: modified,
+    lastModified: lastModified ?? modified,
     isCollection: isCollection,
     photoMetadata: photoMetadata,
   );
@@ -105,6 +106,53 @@ void main() {
       // `putPlaceholder`'s comment exists to prevent
       expect(entry.uri, isEmpty);
       expect(entry.path, isNull);
+    });
+  });
+
+  // Every number above is the server's claim about a file this device has never read, and these are the
+  // ones something downstream divides by or sorts on. The parser takes what the XML says: `_childInt` is a
+  // `num.tryParse`, and `_parseHttpDate` answers the epoch for a header it cannot read.
+  group('what the server says is not taken at face value', () {
+    NextcloudPhotoMetadata sizeOf({int? width, int? height}) => NextcloudPhotoMetadata(
+      width: width,
+      height: height,
+      originalDateTime: null,
+      latitude: null,
+      longitude: null,
+    );
+
+    test('a negative dimension is unknown, not a negative aspect ratio', () {
+      final entry = builder.build(account, itemFor(photoMetadata: sizeOf(width: -1, height: 3024)))!;
+
+      // `displayAspectRatio` guards `== 0` only, so a negative width would come straight through, and the
+      // viewer hands it to `AspectRatio`, which asserts a positive ratio
+      expect(entry.width, 0);
+      expect(entry.height, 0);
+      expect(entry.displayAspectRatio, greaterThan(0));
+    });
+
+    test('a zero dimension is unknown rather than a zero-height tile', () {
+      final entry = builder.build(account, itemFor(photoMetadata: sizeOf(width: 4032, height: 0)))!;
+
+      expect(entry.width, 0);
+      expect(entry.height, 0);
+      expect(entry.displayAspectRatio, 1);
+    });
+
+    test('one side alone is not an aspect ratio', () {
+      final entry = builder.build(account, itemFor(photoMetadata: sizeOf(width: 4032)))!;
+
+      expect(entry.width, 0, reason: 'a width with no height says nothing about the shape of the tile');
+      expect(entry.height, 0);
+    });
+
+    test('the epoch the parser answers for an unreadable file date is unknown, not 1970', () {
+      final entry = builder.build(account, itemFor(lastModified: DateTime.fromMillisecondsSinceEpoch(0, isUtc: true)))!;
+
+      // same reason as the capture date above: a 1970 sorts the item to the start of the library, which
+      // reads as data loss rather than as a property the server did not give
+      expect(entry.dateModifiedMillis, isNull);
+      expect(entry.bestDate, isNull);
     });
   });
 

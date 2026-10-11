@@ -974,6 +974,65 @@ void main() {
       expect(server.downloads, isEmpty, reason: 'already whole: only the pin was missing');
       expect(mirror.rows(accountWith())['a.jpg']?.pinned, isTrue);
     });
+
+    test('an original the sink cannot read leaves the row listed as an unfunded placeholder, which no sync would refill', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase);
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.grid);
+      final enumerations = server.enumerations;
+      final usedBefore = await mirror.usedBytes(accountWith());
+      sink.putFails.add('a.jpg');
+
+      final failure = await useCase.fetchOriginal(accountWith(), 'a.jpg');
+
+      expect(failure, isA<NextcloudLocalStorageFailure>());
+      // The grid bytes are gone for good (the download wrote over them), so the row that is left says
+      // "listed, no bytes", never no row: a pin withholds no etag, so a row removed here would sit under a
+      // subtree every later run trusts, and nothing would ever list it again.
+      final row = mirror.rows(accountWith())['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.placeholder);
+      expect(row.placeholderReason, NextcloudPlaceholderReason.unfunded);
+      expect(row.localSizeBytes, 0);
+      expect(row.etag, 'v1');
+      expect(await File(mirror.localPathFor(accountWith(), 'a.jpg')).exists(), isFalse);
+      expect(sink.demoted, {'a.jpg'}, reason: 'the entry stays and is told its bytes are gone');
+      expect(sink.removed, isEmpty);
+      expect(await mirror.usedBytes(accountWith()), usedBefore - 2, reason: 'the grid bytes went back; the other rows are untouched');
+      // the pin asked for bytes that are not there: it does not survive the failure the user was handed
+      expect(row.pinned, isFalse);
+      expect(await useCase.releaseOriginal(accountWith(), 'a.jpg'), isNull, reason: 'nothing left to unpin');
+
+      // the next run, with nothing changed on the server, takes the fast path past the row and has nothing to do
+      final fetchedBefore = server.fetched.length;
+      await sync(useCase);
+      expect(server.enumerations, enumerations, reason: 'no etag was withheld: the subtree is still promised');
+      expect(server.fetched.length, fetchedBefore);
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.placeholder, reason: 'still listed');
+
+      // a relisting run plans it like any unfunded row and brings it back at grid
+      sink.putFails.clear();
+      await sync(useCase, force: true);
+      expect(mirror.rows(accountWith())['a.jpg']?.tier, NextcloudMirrorTier.grid);
+      expect(sink.putTiers['a.jpg'], NextcloudMirrorTier.grid);
+    });
+
+    test('an original the sink cannot read for a path the mirror never had leaves no row, as before the attempt', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      await sync(useCase);
+      // a file the server gained after the run: listed by `stat`, in no row and in no entry
+      server.files['late.jpg'] = fakeFile('late.jpg', modified: day2, fileId: 9);
+      sink.putFails.add('late.jpg');
+
+      final failure = await useCase.fetchOriginal(accountWith(), 'late.jpg');
+
+      expect(failure, isA<NextcloudLocalStorageFailure>());
+      expect(mirror.rows(accountWith()).containsKey('late.jpg'), isFalse, reason: 'nothing was mirrored before the attempt, so there is nothing to keep');
+      expect(await File(mirror.localPathFor(accountWith(), 'late.jpg')).exists(), isFalse);
+      expect(sink.demoted, isEmpty);
+      expect(sink.removed, isEmpty);
+    });
   });
 
   group('video threshold and placeholders', () {

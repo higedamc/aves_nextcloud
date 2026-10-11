@@ -148,24 +148,42 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         final localPath = _mirror.localPathFor(account, path);
         final observedEtag = await repository.downloadTo(item, localPath, cancellation: cancellation);
         final now = _now();
-        await _mirror.record(
-          account,
-          NextcloudMirrorIndexEntry(
-            relativePath: path,
-            etag: observedEtag ?? item.etag,
-            fileId: item.fileId,
-            tier: NextcloudMirrorTier.original,
-            remoteSizeBytes: item.sizeBytes,
-            localSizeBytes: item.sizeBytes,
-            pinned: true,
-            remoteLastModified: item.lastModified,
-            downloadedAt: now,
-            // asked for by the user: this is a view
-            lastAccessAt: now,
-          ),
+        final row = NextcloudMirrorIndexEntry(
+          relativePath: path,
+          etag: observedEtag ?? item.etag,
+          fileId: item.fileId,
+          tier: NextcloudMirrorTier.original,
+          remoteSizeBytes: item.sizeBytes,
+          localSizeBytes: item.sizeBytes,
+          pinned: true,
+          remoteLastModified: item.lastModified,
+          downloadedAt: now,
+          // asked for by the user: this is a view
+          lastAccessAt: now,
         );
+        await _mirror.record(account, row);
         if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.original)) {
-          await _mirror.remove(account, path);
+          if (existing == null) {
+            // nothing was mirrored before the attempt, so there is nothing to keep: the row goes with the
+            // bytes, as it would for a failed put inside a run
+            await _mirror.remove(account, path);
+          } else {
+            // The entry could not be read from the new bytes. The row the sync funded is gone for good:
+            // `downloadTo` wrote the original over its bytes, and `record` at `original` dropped a view
+            // row's sidecar. Never `remove` what is left, for the reason `_fetchView` gives: a pin runs
+            // outside a run and withholds no etag, so a row removed here sits under a subtree every later
+            // run trusts, and nothing lists it again until the folder changes on the server. The row that
+            // says "listed, no bytes" is the unfunded placeholder, and the sink is told the way it is
+            // told about an eviction: the entry stays, in the gallery and streamed on demand, and what
+            // described its bytes is dropped. A relisting run plans it again like any unfunded row.
+            //
+            // The pin does not survive: `asUnfundedPlaceholder` never carries one, and a pinned row with no
+            // bytes would be current to every run that does not relist, which is a pin nobody comes back
+            // for. The user has the failure in hand and can pin again; a failed put on a pinned row inside
+            // `_download` loses the pin the same way.
+            await _mirror.record(account, row.asUnfundedPlaceholder());
+            await _sink.demoteToPlaceholders(account, {path});
+          }
           throw NextcloudLocalStorageFailure('could not create an entry for $path');
         }
         return null;

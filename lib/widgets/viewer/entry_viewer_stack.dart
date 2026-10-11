@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:aves/app_mode.dart';
 import 'package:aves/model/entry/entry.dart';
+import 'package:aves/model/nextcloud/nextcloud.dart';
 import 'package:aves/model/entry/extensions/multipage.dart';
 import 'package:aves/model/entry/extensions/props.dart';
 import 'package:aves/model/filters/filters.dart';
@@ -119,6 +120,10 @@ class _EntryViewerStackState extends State<EntryViewerStack> with EntryViewContr
     _heroInfoNotifier.value = EntryHeroInfo(collection, entry);
     entryNotifier = viewerController.entryNotifier;
     entryNotifier.value = entry;
+    // the one place the viewer says which entry it shows, for the initial entry and every page change
+    // alike; a mirrored entry fetches its screen-sized tier from here
+    entryNotifier.addListener(_onEntryOpened);
+    _onEntryOpened();
     _currentEntryIndex = max(0, entry != null ? entries.indexOf(entry) : -1);
     _currentVerticalPage = ValueNotifier(imagePage);
     _horizontalPager = PageController(initialPage: _currentEntryIndex);
@@ -185,6 +190,9 @@ class _EntryViewerStackState extends State<EntryViewerStack> with EntryViewContr
   @override
   void dispose() {
     AvesApp.pageRouteObserver.unsubscribe(this);
+    entryNotifier.removeListener(_onEntryOpened);
+    // leaving the viewer: nothing is shown, so nothing is fetched
+    nextcloud.onEntryOpened(null);
     cleanEntryControllers(entryNotifier.value);
     _playingVideoControllerNotifier.removeListener(_onPlayingVideoControllerChanged);
     updatePictureInPicture(context);
@@ -769,6 +777,8 @@ class _EntryViewerStackState extends State<EntryViewerStack> with EntryViewContr
     }
     _updateEntry();
   }
+
+  void _onEntryOpened() => nextcloud.onEntryOpened(entryNotifier.value);
 
   void _onCollectionChanged() {
     _updateEntry();

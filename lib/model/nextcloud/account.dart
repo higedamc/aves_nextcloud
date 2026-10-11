@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:aves/model/nextcloud/paths.dart';
 
 // A configured Nextcloud account.
@@ -28,6 +30,9 @@ class NextcloudAccount {
 
   final bool enabled;
 
+  // see `viewAllowanceBytes`; a test seam, never persisted and never shown
+  final int? _viewAllowanceOverride;
+
   const new({
     required this.id,
     required this.serverUrl,
@@ -37,7 +42,23 @@ class NextcloudAccount {
     required this.cacheLimitBytes,
     this.videoAutoDownloadLimitBytes = defaultVideoAutoDownloadLimitBytes,
     this.enabled = true,
-  });
+    int? viewAllowanceBytes,
+  }) : _viewAllowanceOverride = viewAllowanceBytes;
+
+  // The slice of `cacheLimitBytes` kept for the screen-sized tier that opening an item fetches, as a stated
+  // number rather than whatever the sync leaves over. The sync funds, refuses and sweeps against
+  // `syncBudgetBytes`; a view fetch reserves and evicts inside this allowance only. Two classes that never
+  // share a row cannot fight over one: a sync that has something left to fund can never turn the view
+  // tier's room into a held original, and a view fetch can never cost the gallery a thumbnail or an
+  // offline video. Capped at a quarter of the limit so that a small limit keeps most of itself for the
+  // sync; at the default limit it is 256 MB, about 1,900 opened photos at the measured 135 KB mean. Not a
+  // user setting: `cacheLimitBytes` is the one number the user owns, and this is how it is split.
+  static const defaultViewAllowanceBytes = 256 * _mb;
+
+  int get viewAllowanceBytes => _viewAllowanceOverride ?? math.min(defaultViewAllowanceBytes, cacheLimitBytes ~/ 4);
+
+  // what the sync may hold: grid rows, originals, and the grid sidecar of a view row
+  int get syncBudgetBytes => math.max(0, cacheLimitBytes - viewAllowanceBytes);
 
   // `id` becomes a directory name (`mirrorDirName`) and a credential key, `username` becomes a URL segment:
   // both must be single safe path segments. Creators (settings UI) must check these before constructing.
@@ -116,6 +137,7 @@ class NextcloudAccount {
       cacheLimitBytes: cacheLimitBytes ?? this.cacheLimitBytes,
       videoAutoDownloadLimitBytes: videoAutoDownloadLimitBytes ?? this.videoAutoDownloadLimitBytes,
       enabled: enabled ?? this.enabled,
+      viewAllowanceBytes: _viewAllowanceOverride,
     );
   }
 

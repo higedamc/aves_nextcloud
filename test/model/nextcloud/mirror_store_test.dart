@@ -17,12 +17,15 @@ void main() {
 
   final epoch = DateTime.utc(2026, 10, 1);
 
-  NextcloudAccount accountWith({String id = 'acc1', int cacheLimitBytes = 1000}) => NextcloudAccount(
+  // `viewAllowanceBytes` defaults to 0 here so that `cacheLimitBytes` is the sync budget and the eviction
+  // arithmetic reads off the one number; the view class tests give the allowance explicitly
+  NextcloudAccount accountWith({String id = 'acc1', int cacheLimitBytes = 1000, int viewAllowanceBytes = 0}) => NextcloudAccount(
     id: id,
     serverUrl: Uri.parse('https://cloud.example.com'),
     username: 'alice',
     rootFolder: 'Photos',
     cacheLimitBytes: cacheLimitBytes,
+    viewAllowanceBytes: viewAllowanceBytes,
   );
 
   NextcloudMirrorIndexEntry entryFor(
@@ -254,6 +257,12 @@ void main() {
     return outcome.demoted;
   }
 
+  Future<NextcloudEvictionOutcome> evictOldestFirstOutcome(NextcloudAccount account, {int reserveBytes = 0, NextcloudSyncFunding? funding}) async {
+    final outcome = await store.evictToFit(account, reserveBytes: reserveBytes, order: NextcloudEvictionOrder.oldestFirst, funding: funding);
+    expect(outcome.removed, isEmpty, reason: 'eviction demotes, it never removes');
+    return outcome;
+  }
+
   Future<Set<String>> evictOldestFirst(NextcloudAccount account, {int reserveBytes = 0, NextcloudSyncFunding? funding}) async {
     final outcome = await store.evictToFit(account, reserveBytes: reserveBytes, order: NextcloudEvictionOrder.oldestFirst, funding: funding);
     expect(outcome.removed, isEmpty, reason: 'eviction demotes, it never removes');
@@ -380,6 +389,202 @@ void main() {
       expect(evicted.length, 300);
       expect(await store.usedBytes(account), 0);
       expect(index.getLeastRecentlyAccessedCalls, greaterThan(1));
+    });
+  });
+
+  group('view rows', () {
+    // a view row as a view fetch leaves it: the view bytes at the path, the grid bytes as the sidecar
+    Future<void> recordView(NextcloudAccount account, String relativePath, {required int viewBytes, required int gridBytes, DateTime? lastAccessAt, DateTime? modified}) async {
+      await writeMirrorFile(account, relativePath, viewBytes);
+      final sidecar = File(store.sidecarPathFor(account, relativePath));
+      await sidecar.parent.create(recursive: true);
+      await sidecar.writeAsBytes(List.filled(gridBytes, 0));
+      await store.record(account, entryFor(relativePath, sizeBytes: viewBytes + gridBytes, tier: NextcloudMirrorTier.view, lastAccessAt: lastAccessAt, modified: modified));
+    }
+
+    Future<NextcloudEvictionOutcome> evictViews(NextcloudAccount account, {int reserveBytes = 0}) async {
+      final outcome = await store.evictToFit(account, reserveBytes: reserveBytes, order: NextcloudEvictionOrder.viewRowsLeastRecentlyAccessed);
+      expect(outcome.removed, isEmpty, reason: 'eviction demotes, it never removes');
+      return outcome;
+    }
+
+    Future<void> expectGrid(NextcloudAccount account, String relativePath, {required int gridBytes}) async {
+      final row = (await store.lookup(account, relativePath))!;
+      expect(row.tier, NextcloudMirrorTier.grid);
+      expect(row.localSizeBytes, gridBytes, reason: 'read back from the sidecar now in place');
+      expect(row.sidecarSizeBytes, 0);
+      expect(await File(store.localPathFor(account, relativePath)).length(), gridBytes);
+      expect(await File(store.sidecarPathFor(account, relativePath)).exists(), isFalse);
+    }
+
+    test('the sidecar lives apart from the mirror tree, where no server name can reach it', () {
+      final account = accountWith();
+      expect(store.sidecarPathFor(account, 'trip/a.jpg'), '${tempDir.path}/sidecars/acc1/trip/a.jpg');
+      // a legal Nextcloud file name, and nothing beside it is a sidecar
+      expect(store.localPathFor(account, 'notes.grid'), '${tempDir.path}/acc1/notes.grid');
+      expect(store.localPathFor(account, 'a.jpg.grid'), '${tempDir.path}/acc1/a.jpg.grid');
+      expect(() => store.sidecarPathFor(account, ''), throwsA(isA<NextcloudPathEscapeFailure>()));
+      expect(() => store.sidecarPathFor(account, '../a.jpg'), throwsA(isA<NextcloudPathEscapeFailure>()));
+    });
+
+    test('the sidecar tree is no account, and the one id that would collide with it is refused where it would matter', () {
+      expect(store.accountIdFor('${tempDir.path}/acc1/trip/a.jpg'), 'acc1');
+      expect(store.accountIdFor('${tempDir.path}/acc1'), isNull);
+      expect(store.accountIdFor('${tempDir.path}/sidecars/acc1/trip/a.jpg'), isNull);
+      expect(store.accountIdFor('/storage/emulated/0/Pictures/a.jpg'), isNull);
+      // not at load, which could only make an account already on disk fail to load
+      final collides = accountWith(id: NextcloudMirrorStore.sidecarsDirName);
+      expect(() => store.localPathFor(collides, 'a.jpg'), throwsA(isA<NextcloudPathEscapeFailure>()));
+    });
+
+    test('a view row counts both files, with the sidecar as its sync-class share', () async {
+      final account = accountWith(cacheLimitBytes: 100, viewAllowanceBytes: 40);
+      await recordView(account, 'a.jpg', viewBytes: 30, gridBytes: 4);
+      await recordWritten(account, 'b.jpg', 10, tier: NextcloudMirrorTier.grid);
+
+      final row = (await store.lookup(account, 'a.jpg'))!;
+      expect(row.localSizeBytes, 34);
+      expect(row.sidecarSizeBytes, 4);
+      expect(row.syncClassBytes, 4);
+      expect(row.viewClassBytes, 30);
+      expect(await store.usedBytes(account), 44, reason: 'the whole mirror: what disk reconciliation compares against');
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.sync), 14);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.view), 30);
+      expect(await store.freeBytes(account, NextcloudBudgetClass.sync), 60 - 14);
+      expect(await store.freeBytes(account, NextcloudBudgetClass.view), 40 - 30);
+    });
+
+    test('a view row without its sidecar is a failure, like a row without its file', () async {
+      final account = accountWith(cacheLimitBytes: 100);
+      await writeMirrorFile(account, 'a.jpg', 30);
+
+      await expectLater(store.record(account, entryFor('a.jpg', sizeBytes: 30, tier: NextcloudMirrorTier.view)), throwsA(isA<NextcloudNotFoundFailure>()));
+      expect(await store.lookup(account, 'a.jpg'), isNull);
+    });
+
+    test('a row at any other tier drops a stale sidecar, so nothing on disk is claimed by no row', () async {
+      final account = accountWith(cacheLimitBytes: 100, viewAllowanceBytes: 40);
+      await recordView(account, 'a.jpg', viewBytes: 30, gridBytes: 4);
+
+      // the sync re-fetched the file at grid over the view bytes
+      await writeMirrorFile(account, 'a.jpg', 5);
+      await store.record(account, entryFor('a.jpg', sizeBytes: 5, tier: NextcloudMirrorTier.grid));
+
+      final row = (await store.lookup(account, 'a.jpg'))!;
+      expect(row.localSizeBytes, 5);
+      expect(row.sidecarSizeBytes, 0);
+      expect(await File(store.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+
+      // and a placeholder written over a view row takes both files
+      await recordView(account, 'b.jpg', viewBytes: 30, gridBytes: 4);
+      await store.record(account, entryFor('b.jpg', sizeBytes: 34, tier: NextcloudMirrorTier.placeholder));
+      expect(await File(store.localPathFor(account, 'b.jpg')).exists(), isFalse);
+      expect(await File(store.sidecarPathFor(account, 'b.jpg')).exists(), isFalse);
+      expect(await store.usedBytes(account), 5);
+    });
+
+    test('remove and purge take the sidecar with them', () async {
+      final account = accountWith(cacheLimitBytes: 100, viewAllowanceBytes: 40);
+      await recordView(account, 'a.jpg', viewBytes: 30, gridBytes: 4);
+      await recordView(account, 'b.jpg', viewBytes: 30, gridBytes: 4);
+
+      await store.remove(account, 'a.jpg');
+      expect(await File(store.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(await File(store.sidecarPathFor(account, 'b.jpg')).exists(), isTrue);
+
+      await store.purge(account);
+      expect(await Directory('${tempDir.path}/sidecars/acc1').exists(), isFalse);
+    });
+
+    test('the view order gives up the least recently opened view row, back to its grid bytes, and nothing else', () async {
+      final account = accountWith(cacheLimitBytes: 1000, viewAllowanceBytes: 60);
+      await recordView(account, 'old.jpg', viewBytes: 30, gridBytes: 4, lastAccessAt: epoch);
+      await recordView(account, 'new.jpg', viewBytes: 30, gridBytes: 4, lastAccessAt: epoch.add(const Duration(days: 1)));
+      await recordWritten(account, 'never.jpg', 10, tier: NextcloudMirrorTier.grid, lastAccessAt: epoch.subtract(const Duration(days: 1)));
+      await recordWritten(account, 'v.mp4', 10, lastAccessAt: epoch.subtract(const Duration(days: 1)));
+      final syncBytes = await store.usedBytes(account, of: NextcloudBudgetClass.sync);
+
+      final outcome = await evictViews(account, reserveBytes: 30);
+
+      expect(outcome.demotedToGrid, {'old.jpg'});
+      expect(outcome.demoted, isEmpty, reason: 'nothing lost its bytes');
+      await expectGrid(account, 'old.jpg', gridBytes: 4);
+      expect((await store.lookup(account, 'new.jpg'))!.tier, NextcloudMirrorTier.view);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.view), 30);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.sync), syncBytes, reason: 'the grid bytes moved from the sidecar to the path: same class, same count');
+
+      // a reservation no view row can make room for takes the last view row and stops: the sync-held
+      // rows are not browsing's to spend, however old, and the caller is told it does not fit
+      final hopeless = await evictViews(account, reserveBytes: 500);
+      expect(hopeless.demotedToGrid, {'new.jpg'});
+      expect(hopeless.demoted, isEmpty);
+      expect((await store.lookup(account, 'never.jpg'))!.tier, NextcloudMirrorTier.grid);
+      expect((await store.lookup(account, 'v.mp4'))!.tier, NextcloudMirrorTier.original);
+      expect(await store.freeBytes(account, NextcloudBudgetClass.view), 60);
+    });
+
+    test('a sync order reaching a view row takes its grid bytes at the row\'s own place in the order, not after the newer rows on the page', () async {
+      // the sync budget is `cacheLimitBytes` here (allowance 0); the view row sits in it as its 4 sidecar bytes
+      final account = accountWith(cacheLimitBytes: 10, viewAllowanceBytes: 0);
+      await recordView(account, 'old.jpg', viewBytes: 30, gridBytes: 4, modified: epoch);
+      await recordWritten(account, 'new.jpg', 4, tier: NextcloudMirrorTier.grid, modified: epoch.add(const Duration(days: 1)));
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.sync), 8);
+
+      final outcome = await evictOldestFirstOutcome(account, reserveBytes: 6);
+
+      // oldest first: the opened photo loses its thumbnail before the never-opened newer one, as it would
+      // have unopened, and the row that went both ways in one pass is reported once, as bytes gone
+      expect(outcome.demoted, {'old.jpg'});
+      expect(outcome.demotedToGrid, isEmpty);
+      await expectDemoted(account, 'old.jpg', remoteSizeBytes: 34);
+      expect(await File(store.sidecarPathFor(account, 'old.jpg')).exists(), isFalse);
+      expect((await store.lookup(account, 'new.jpg'))!.tier, NextcloudMirrorTier.grid);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.sync), 4);
+      expect(await store.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+    });
+
+    test('a sync class within its budget leaves a view row alone, however many view bytes it holds', () async {
+      // 34 bytes on disk against a 10-byte sync budget, 4 of them sync-class: nothing is over
+      final account = accountWith(cacheLimitBytes: 10, viewAllowanceBytes: 0);
+      await recordView(account, 'old.jpg', viewBytes: 30, gridBytes: 4, modified: epoch);
+      await recordWritten(account, 'new.jpg', 4, tier: NextcloudMirrorTier.grid, modified: epoch.add(const Duration(days: 1)));
+
+      expect((await evictOldestFirstOutcome(account)).isEmpty, isTrue, reason: 'the view bytes are not the sync\'s concern');
+      expect((await store.lookup(account, 'old.jpg'))!.tier, NextcloudMirrorTier.view);
+      expect(await File(store.sidecarPathFor(account, 'old.jpg')).exists(), isTrue);
+    });
+
+    test('a view row whose sidecar is missing demotes to a placeholder like any other row', () async {
+      final account = accountWith(cacheLimitBytes: 1000, viewAllowanceBytes: 20);
+      await recordView(account, 'a.jpg', viewBytes: 30, gridBytes: 4);
+      await File(store.sidecarPathFor(account, 'a.jpg')).delete();
+
+      final outcome = await evictViews(account);
+
+      expect(outcome.demoted, {'a.jpg'});
+      expect(outcome.demotedToGrid, isEmpty);
+      await expectDemoted(account, 'a.jpg', remoteSizeBytes: 34);
+    });
+
+    test('sweepStraySidecars deletes a sidecar whose row is not a view row and keeps one whose row is', () async {
+      final account = accountWith(cacheLimitBytes: 1000, viewAllowanceBytes: 40);
+      await recordView(account, 'kept.jpg', viewBytes: 30, gridBytes: 4);
+      await recordWritten(account, 'grid.jpg', 4, tier: NextcloudMirrorTier.grid);
+      for (final stray in ['grid.jpg', 'unknown/x.jpg']) {
+        final file = File(store.sidecarPathFor(account, stray));
+        await file.parent.create(recursive: true);
+        await file.writeAsBytes([0]);
+      }
+      final other = accountWith(id: 'acc2');
+      await recordView(other, 'theirs.jpg', viewBytes: 30, gridBytes: 4);
+
+      await store.sweepStraySidecars(account);
+
+      expect(await File(store.sidecarPathFor(account, 'kept.jpg')).exists(), isTrue);
+      expect(await File(store.sidecarPathFor(account, 'grid.jpg')).exists(), isFalse);
+      expect(await File(store.sidecarPathFor(account, 'unknown/x.jpg')).exists(), isFalse);
+      expect(await File(store.sidecarPathFor(other, 'theirs.jpg')).exists(), isTrue);
     });
   });
 

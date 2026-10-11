@@ -20,13 +20,16 @@ void main() {
   late FakeNextcloudCredentialStore credentials;
   var clock = DateTime.utc(2026, 10, 9, 12);
 
-  NextcloudAccount accountWith({int cacheLimitBytes = 1000, String id = 'acc1', int videoAutoDownloadLimitBytes = NextcloudAccount.defaultVideoAutoDownloadLimitBytes}) => NextcloudAccount(
+  // `viewAllowanceBytes` defaults to 0 here so that `cacheLimitBytes` is the sync budget and the budget
+  // arithmetic reads off the one number; the view tier tests give the allowance explicitly
+  NextcloudAccount accountWith({int cacheLimitBytes = 1000, String id = 'acc1', int videoAutoDownloadLimitBytes = NextcloudAccount.defaultVideoAutoDownloadLimitBytes, int viewAllowanceBytes = 0}) => NextcloudAccount(
     id: id,
     serverUrl: Uri.parse('https://cloud.example.com'),
     username: 'alice',
     rootFolder: 'Photos',
     cacheLimitBytes: cacheLimitBytes,
     videoAutoDownloadLimitBytes: videoAutoDownloadLimitBytes,
+    viewAllowanceBytes: viewAllowanceBytes,
   );
 
   final day1 = DateTime.utc(2026, 10, 1);
@@ -1106,6 +1109,267 @@ void main() {
       expect(server.downloads, ['Sub/b.mp4'], reason: 'the raised budget relists and funds it');
       expect(funded.updated, 1);
       expect(mirror.rows(accountWith())['Sub/b.mp4']?.tier, NextcloudMirrorTier.original);
+    });
+  });
+
+  group('view tier', () {
+    // the sync holds grid rows of 2 bytes (`previewBytes`); a view fetch lands whatever `previewBytes` is
+    // at the time, and reserves the item's size (3 bytes here, well under `viewReserveBytes`)
+    Future<NextcloudSyncUseCaseImpl> synced(FakeNextcloudRepository server, NextcloudAccount account) async {
+      final useCase = useCaseWith(server);
+      await sync(useCase, account: account);
+      return useCase;
+    }
+
+    Future<NextcloudFailure?> open(NextcloudSyncUseCaseImpl useCase, NextcloudAccount account, String path, {required FakeNextcloudRepository server}) async {
+      server.previewBytes = 3;
+      clock = clock.add(const Duration(hours: 1));
+      try {
+        return await useCase.fetchView(account, path);
+      } finally {
+        server.previewBytes = 2;
+      }
+    }
+
+    test('opening a grid row fetches the view tier inside the allowance and keeps the grid bytes as the sidecar', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 3);
+      final useCase = await synced(server, account);
+      final syncBytesBefore = await mirror.usedBytes(account, of: NextcloudBudgetClass.sync);
+
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+
+      expect(server.previews.last, 'a.jpg@1024x1024');
+      expect(sink.putTiers['a.jpg'], NextcloudMirrorTier.view);
+      final row = mirror.rows(account)['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.view);
+      expect(row.localSizeBytes, 5, reason: 'both files: 3 view bytes and the 2 grid bytes kept aside');
+      expect(row.sidecarSizeBytes, 2);
+      expect(row.lastAccessAt, clock, reason: 'an open is an access');
+      expect(await File(mirror.localPathFor(account, 'a.jpg')).length(), 3);
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).length(), 2);
+      // the partition: the sync class is exactly what it was, the view class is the view bytes
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.sync), syncBytesBefore);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 3);
+    });
+
+    test('a view fetch the allowance cannot hold is refused before anything is touched, and the viewer keeps the grid bytes', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 2);
+      final useCase = await synced(server, account);
+      final previewsBefore = server.previews.length;
+
+      final failure = await open(useCase, account, 'a.jpg', server: server);
+
+      expect(failure, isA<NextcloudQuotaFailure>());
+      expect((failure as NextcloudQuotaFailure).availableBytes, 2, reason: 'the allowance, not the whole limit');
+      expect(server.previews.length, previewsBefore);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.grid);
+      expect(await File(mirror.localPathFor(account, 'a.jpg')).length(), 2);
+      expect(sink.demotedToGrid, isEmpty);
+      expect(sink.demoted, isEmpty);
+    });
+
+    test('a full allowance gives up the least recently opened view row, back to its grid bytes, and never a sync-held row', () async {
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [
+          fakeFile('a.jpg', modified: day1, fileId: 1),
+          fakeFile('b.jpg', modified: day2, fileId: 2),
+          fakeFile('c.jpg', modified: day3, fileId: 3),
+          fakeFile('v.mp4', modified: day3, fileId: 4),
+        ],
+      );
+      // room for two view rows
+      final account = accountWith(viewAllowanceBytes: 6);
+      final useCase = await synced(server, account);
+      final syncBytes = await mirror.usedBytes(account, of: NextcloudBudgetClass.sync);
+      for (final path in ['a.jpg', 'b.jpg', 'a.jpg']) {
+        expect(await open(useCase, account, path, server: server), isNull, reason: path);
+      }
+      expect(server.previewPaths.where((v) => v == 'a.jpg').length, 2, reason: 'grid at sync, view on the first open, nothing on the second: it is held');
+      expect(mirror.rows(account)['a.jpg']?.lastAccessAt, clock, reason: 'but the second open is an access');
+
+      expect(await open(useCase, account, 'c.jpg', server: server), isNull);
+
+      expect(sink.demotedToGrid, {'b.jpg'}, reason: 'a was opened again after b');
+      expect(sink.demoted, isEmpty, reason: 'nothing lost its bytes: the grid bytes were kept aside for this');
+      final b = mirror.rows(account)['b.jpg']!;
+      expect(b.tier, NextcloudMirrorTier.grid);
+      expect(b.localSizeBytes, 2);
+      expect(b.sidecarSizeBytes, 0);
+      expect(await File(mirror.localPathFor(account, 'b.jpg')).length(), 2, reason: 'the sidecar is back in place');
+      expect(await File(mirror.sidecarPathFor(account, 'b.jpg')).exists(), isFalse);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.view);
+      expect(mirror.rows(account)['c.jpg']?.tier, NextcloudMirrorTier.view);
+      expect(mirror.rows(account)['v.mp4']?.tier, NextcloudMirrorTier.original, reason: 'the offline video is not browsing\'s to spend');
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.sync), syncBytes);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 6);
+    });
+
+    test('opening anything but a grid image records the access and fetches nothing', () async {
+      final server = serverWith()..previewFailures['a.jpg'] = const NextcloudPreviewUnavailableFailure('a.jpg');
+      final account = accountWith(viewAllowanceBytes: 100);
+      final useCase = await synced(server, account);
+      server.previewFailures.clear();
+      expect(await useCase.fetchOriginal(account, 'Sub/Deep/c.jpg'), isNull);
+      final fetchedBefore = server.fetched.length;
+
+      // a placeholder has no bytes to improve on, a video is not an image, an original is already better
+      for (final path in ['a.jpg', 'Sub/b.mp4', 'Sub/Deep/c.jpg']) {
+        expect(await open(useCase, account, path, server: server), isNull, reason: path);
+        expect(mirror.rows(account)[path]?.lastAccessAt, clock, reason: path);
+      }
+      expect(await open(useCase, account, 'never-listed.jpg', server: server), isNull);
+
+      expect(server.fetched.length, fetchedBefore);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+    });
+
+    test('an item that changed on the server is not fetched on open: the sync owns changes', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 100);
+      final useCase = await synced(server, account);
+      server.files['a.jpg'] = fakeFile('a.jpg', etag: 'v2', modified: day2, fileId: 1);
+      final previewsBefore = server.previews.length;
+
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+
+      expect(server.previews.length, previewsBefore, reason: 'a view of the new bytes over a sidecar of the old would be a row whose two files disagree');
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.grid);
+    });
+
+    test('the sync never fetches the view tier: a forced or changed view row is re-fetched at grid and loses its sidecar', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 3);
+      final useCase = await synced(server, account);
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+
+      // unchanged: current at the held tier, nothing fetched
+      server.collections[''] = 'root-v2';
+      final fetchedBefore = server.fetched.length;
+      await sync(useCase, account: account);
+      expect(server.fetched.length, fetchedBefore);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.view);
+
+      // forced: re-fetched at grid, never at the view edge, and the sidecar goes with the row
+      await sync(useCase, account: account, force: true);
+      expect(server.previews.where((v) => v == 'a.jpg@1024x1024').length, 1, reason: 'the one open');
+      var row = mirror.rows(account)['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.grid);
+      expect(row.localSizeBytes, 2);
+      expect(row.sidecarSizeBytes, 0);
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+
+      // changed: the same, and the next open fetches the view again
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+      server.collections[''] = 'root-v3';
+      server.files['a.jpg'] = fakeFile('a.jpg', etag: 'v2', modified: day2, fileId: 1);
+      await sync(useCase, account: account);
+      row = mirror.rows(account)['a.jpg']!;
+      expect(row.tier, NextcloudMirrorTier.grid);
+      expect(row.etag, 'v2');
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.view);
+      expect(server.previews.where((v) => v == 'a.jpg@1024x1024').length, 3);
+    });
+
+    test('a pinned download funds against the sync budget, never the allowance', () async {
+      const kb = 1024;
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [fakeFile('a.jpg', size: 100 * kb, modified: day1, fileId: 1)],
+      );
+      // 200 KB in all, 120 KB of them the allowance: the whole file fits the limit and does not fit the
+      // 80 KB sync budget (whose grid reservation, the 64 KB ceiling, does)
+      final account = accountWith(cacheLimitBytes: 200 * kb, viewAllowanceBytes: 120 * kb);
+      final useCase = await synced(server, account);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.grid);
+
+      final failure = await useCase.fetchOriginal(account, 'a.jpg');
+
+      expect(failure, isA<NextcloudQuotaFailure>());
+      expect((failure as NextcloudQuotaFailure).availableBytes, 80 * kb, reason: 'the sync budget is what a pin is refused by');
+      expect(server.downloads, isEmpty);
+      expect(mirror.rows(account)['a.jpg']?.tier, NextcloudMirrorTier.grid);
+
+      // a sync budget the file fits, and it is pinned with the allowance untouched either way
+      final roomy = accountWith(cacheLimitBytes: 220 * kb, viewAllowanceBytes: 120 * kb);
+      expect(await useCase.fetchOriginal(roomy, 'a.jpg'), isNull);
+      expect(mirror.rows(roomy)['a.jpg']?.pinned, isTrue);
+      expect(await mirror.usedBytes(roomy, of: NextcloudBudgetClass.sync), 100 * kb);
+      expect(await mirror.usedBytes(roomy, of: NextcloudBudgetClass.view), 0);
+    });
+
+    test('a view row the sync overflow reaches ends as a placeholder reported once, and its view bytes fund nothing', () async {
+      final server = serverWith(
+        collections: {'': 'root-v1'},
+        files: [
+          fakeFile('a.jpg', modified: day1, fileId: 1),
+          fakeFile('b.jpg', modified: day2, fileId: 2),
+        ],
+      );
+      // sync budget 5: the two grid rows (2 bytes each, reserved at their 3-byte size) fill it to 4, and
+      // the 2-byte item to come cannot be reserved without taking one
+      final account = accountWith(cacheLimitBytes: 8, viewAllowanceBytes: 3);
+      final useCase = await synced(server, account);
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.sync), 4);
+
+      clock = clock.add(const Duration(days: 1));
+      server.collections[''] = 'root-v2';
+      server.files['c.jpg'] = fakeFile('c.jpg', size: 2, modified: day3, fileId: 3);
+      final result = await sync(useCase, account: account);
+
+      expect(server.previewPaths.last, 'c.jpg');
+      expect(result.demoted, 1);
+      expect(result.evicted, 0);
+      expect(sink.demoted, {'a.jpg'}, reason: 'the oldest grid row, opened or not');
+      expect(sink.demotedToGrid, isEmpty, reason: 'a row whose bytes are gone is reported once, as such');
+      final a = mirror.rows(account)['a.jpg']!;
+      expect(a.tier, NextcloudMirrorTier.placeholder);
+      expect(a.placeholderReason, NextcloudPlaceholderReason.unfunded);
+      expect(a.sidecarSizeBytes, 0);
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).exists(), isFalse);
+      expect(mirror.rows(account)['b.jpg']?.tier, NextcloudMirrorTier.grid, reason: 'a\'s 2 grid bytes funded c, not its 3 view bytes, and b is newer than a');
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.sync), 4, reason: 'b and c');
+      expect(await mirror.usedBytes(account, of: NextcloudBudgetClass.view), 0);
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v2'));
+    });
+
+    test('the partition landing on a mirror built before it sweeps the sync class down to the sync budget, demoting and not relisting', () async {
+      final server = serverWith();
+      final useCase = useCaseWith(server);
+      // a mirror filled to the whole limit, as on every install before the allowance existed
+      await sync(useCase, account: accountWith(cacheLimitBytes: 7, viewAllowanceBytes: 0));
+      expect(await mirror.usedBytes(accountWith()), 7);
+      final enumerations = server.enumerations;
+
+      final result = await sync(useCase, account: accountWith(cacheLimitBytes: 7, viewAllowanceBytes: 3));
+
+      expect(result.demoted, 1);
+      expect(result.evicted, 0, reason: 'a demotion is not a gap, so the etags stay and nothing is relisted');
+      expect(sink.demoted, {'Sub/b.mp4'}, reason: 'the sync order: originals first');
+      expect(await mirror.usedBytes(accountWith(), of: NextcloudBudgetClass.sync), 4);
+      expect(server.enumerations, enumerations, reason: 'the root was unchanged');
+      expect(states.states['acc1']?.collectionEtags, containsPair('', 'root-v1'));
+    });
+
+    test('a sidecar left behind by a dead view fetch is swept before listing, and a view row keeps its own', () async {
+      final server = serverWith();
+      final account = accountWith(viewAllowanceBytes: 3);
+      final useCase = await synced(server, account);
+      expect(await open(useCase, account, 'a.jpg', server: server), isNull);
+      final stray = File(mirror.sidecarPathFor(account, 'Sub/Deep/c.jpg'));
+      await stray.parent.create(recursive: true);
+      await stray.writeAsBytes([0]);
+
+      await sync(useCase, account: account);
+
+      expect(await stray.exists(), isFalse);
+      expect(await File(mirror.sidecarPathFor(account, 'a.jpg')).exists(), isTrue);
     });
   });
 

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:aves/model/entry/entry.dart';
+import 'package:aves/model/entry/extensions/nextcloud.dart';
 import 'package:aves/model/nextcloud/account.dart';
 import 'package:aves/model/nextcloud/account_store_impl.dart';
 import 'package:aves/model/nextcloud/account_use_case.dart';
@@ -8,7 +10,9 @@ import 'package:aves/model/nextcloud/credential_store_impl.dart';
 import 'package:aves/model/nextcloud/mirror_index_sqflite.dart';
 import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/mirror_store_impl.dart';
+import 'package:aves/model/nextcloud/errors.dart';
 import 'package:aves/model/nextcloud/paths.dart';
+import 'package:aves/model/nextcloud/repository.dart';
 import 'package:aves/model/nextcloud/sync.dart';
 import 'package:aves/model/nextcloud/sync_ports.dart';
 import 'package:aves/model/nextcloud/sync_sink_impl.dart';
@@ -38,6 +42,9 @@ class Nextcloud {
   Future<void>? _initializer;
   bool _startupSyncRequested = false;
   final Map<String, ValueNotifier<NextcloudSyncStatus>> _statuses = {};
+
+  // the view fetch of the entry the viewer showed last; opening another cancels it before it starts
+  NextcloudCancellation? _openCancellation;
 
   new _private();
 
@@ -118,6 +125,38 @@ class Nextcloud {
       notifier.value = NextcloudSyncStatus(lastResult: notifier.value.lastResult, error: error);
       return null;
     }
+  }
+
+  // The viewer shows `entry`. For a mirrored entry this records the access and fetches the view tier
+  // (`NextcloudSyncUseCase.fetchView`), through the use case so that it is serialized with the sync. Only
+  // the entry shown last is fetched: paging through an album cancels every open behind the current one
+  // before it starts, so flicking past fifty photos costs one fetch and not fifty. The account is read
+  // from the mirror layout. A refusal (the allowance is full) is silent by design, the viewer keeps the
+  // grid bytes; anything else is logged, never shown — an open must not raise an error for a nicer image.
+  void onEntryOpened(AvesEntry? entry) {
+    _openCancellation?.cancel();
+    _openCancellation = null;
+    if (entry == null || !entry.isNextcloud) return;
+    final path = entry.path;
+    final sync = _sync;
+    // not initialized: nothing was mirrored this session, so there is no row to touch
+    if (path == null || sync == null) return;
+    final accountId = mirrorStore.accountIdFor(path);
+    final account = knownAccounts.firstWhereOrNull((account) => account.id == accountId);
+    if (account == null) return;
+    final relativePath = mirrorStore.relativePathFor(account, path);
+    if (relativePath == null) return;
+    final cancellation = NextcloudCancellation();
+    _openCancellation = cancellation;
+    unawaited(
+      sync.fetchView(account, relativePath, cancellation: cancellation).then(
+        (failure) {
+          if (failure == null || failure is NextcloudCancelledFailure || failure is NextcloudQuotaFailure) return;
+          unawaited(reportService.log('Nextcloud view fetch $relativePath: $failure'));
+        },
+        onError: reportService.recordError,
+      ),
+    );
   }
 
   Future<void> syncAll(CollectionSource source) async {

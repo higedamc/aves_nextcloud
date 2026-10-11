@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:aves/model/covers.dart';
 import 'package:aves/model/entry/cache.dart';
@@ -157,6 +158,11 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
             if (presetCatalog == null) EntryDataType.catalog,
           },
         );
+        // New bytes at the same path, by definition of a put over an existing entry: the images decoded
+        // from the old ones must go. `refresh` only notices a visual change through the file date, and a
+        // derivative fetched for the same server version (the view tier over the grid tier) keeps it.
+        EntryCache.evict(existing.uri);
+        existing.visualChangeNotifier.notify();
       } else {
         // a row outside the loaded scope, or a reload in progress: update the row, and drop the metadata of
         // the old bytes so the entry is catalogued again when a full load adds it. The collection is not
@@ -207,6 +213,29 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
       // notifier is what the thumbnail and viewer widgets listen to, and it is announced after the
       // eviction so a listener that reloads does not find the stale image again
       EntryCache.evict(uri);
+      entry.visualChangeNotifier.notify();
+    }
+  }
+
+  @override
+  Future<void> demoteToGrid(NextcloudAccount account, Set<String> relativePaths) async {
+    if (relativePaths.isEmpty) return;
+    final index = await _idByUri;
+    for (final path in relativePaths) {
+      final uri = _uriFor(account, path);
+      final id = index[uri];
+      final entry = id == null ? null : _source.getEntryById(id);
+      // a row outside the loaded scope (or none): nothing cached describes its bytes, and the next full
+      // load reads the row as it is, whose dimensions differ from the grid bytes' in size only
+      if (entry == null) continue;
+      EntryCache.evict(uri);
+      // `basic` and `aspectRatio` only: what the grid bytes decide. Not `catalog`, which the properties
+      // gave the entry and the bytes cannot (a derivative carries no Exif). A refresh with `basic` drops
+      // the DB row and writes it back from the bytes it reads, so it is only asked for bytes that are
+      // there: a path whose file is gone after all is a row with no bytes behind it, told as such.
+      if (await File(_mirror.localPathFor(account, path)).exists()) {
+        await _source.refreshEntries({entry}, {EntryDataType.basic, EntryDataType.aspectRatio});
+      }
       entry.visualChangeNotifier.notify();
     }
   }

@@ -16,7 +16,11 @@ enum NextcloudMirrorTier {
   // Cheap enough to hold for every listed item.
   grid,
 
-  // Screen-sized derivative, fetched when an item is opened and evictable like any cache entry.
+  // Screen-sized derivative, fetched when an item is opened and evictable like any cache entry. A row at
+  // this tier keeps its grid bytes as a sidecar (`NextcloudMirrorStore.sidecarPathFor`), so that giving
+  // the view bytes back is a local rename to `grid` and works offline, which is when the budget bites.
+  // Both files count in `localSizeBytes`, the sidecar's share in `sidecarSizeBytes`: the sidecar is the
+  // grid tier the sync funded, the view bytes are what browsing funded, see `NextcloudBudgetClass`.
   view,
 
   // The file's own bytes, byte for byte. The only tier that carries the original metadata, and the
@@ -38,6 +42,28 @@ enum NextcloudPlaceholderReason {
   // the planning step then treats this row as a gap to fill, while the completeness rule accepts it as
   // is, since the mirror reflects the server honestly in both states.
   unfunded,
+}
+
+// How `cacheLimitBytes` is split, see `NextcloudAccount.viewAllowanceBytes`. Two classes that never share
+// a byte: every byte on disk belongs to exactly one, so neither evictor can take what the other funded.
+// The class carries its own limit (`limitFor`) and the store sums its own bytes for it (`usedBytes`,
+// `freeBytes`), so that "how full is the sync budget" and "how full is the allowance" are two questions
+// with two answers, and a caller cannot pair the allowance with the sync sum: it names a class, not a sum.
+enum NextcloudBudgetClass {
+  // What the sync holds against `syncBudgetBytes`: grid rows, originals, and the grid sidecar of a view
+  // row, which is the grid tier the sync funded and keeps on through a view fetch. **Pinned originals
+  // fund against this class too**: a pin is a durable request for whole bytes, machine work and pins on
+  // one side, transient views on the other. Were pins to fund against the allowance, one pinned video
+  // would eat it whole and the view tier would be dead with the partition in place and looking correct.
+  sync,
+
+  // what browsing holds against `viewAllowanceBytes`: the view bytes of view rows, and nothing else
+  view;
+
+  int limitFor(NextcloudAccount account) => switch (this) {
+    NextcloudBudgetClass.sync => account.syncBudgetBytes,
+    NextcloudBudgetClass.view => account.viewAllowanceBytes,
+  };
 }
 
 // One mirrored file, as tracked by the mirror index (layer L3).
@@ -64,6 +90,10 @@ class NextcloudMirrorIndexEntry {
   // report a mirror of a few hundred megabytes as hundreds of gigabytes and evict everything forever.
   final int localSizeBytes;
 
+  // the share of `localSizeBytes` that is the grid sidecar of a `view` row, read back from disk like the
+  // rest; 0 for every other tier. What splits the row between the two budget classes.
+  final int sidecarSizeBytes;
+
   // the user asked for these bytes explicitly (a download, a wallpaper, an export), so eviction must
   // not take them and a sync must not replace them with a cheaper tier. Distinct from `tier`:
   // `original` describes what is held, `pinned` describes whether anyone asked for it.
@@ -82,14 +112,22 @@ class NextcloudMirrorIndexEntry {
     this.placeholderReason,
     required this.remoteSizeBytes,
     required this.localSizeBytes,
+    this.sidecarSizeBytes = 0,
     this.pinned = false,
     required this.remoteLastModified,
     required this.downloadedAt,
     required this.lastAccessAt,
-  }) : assert((tier == NextcloudMirrorTier.placeholder) == (placeholderReason != null), 'a placeholder row carries its reason, and no other tier does');
+  }) : assert((tier == NextcloudMirrorTier.placeholder) == (placeholderReason != null), 'a placeholder row carries its reason, and no other tier does'),
+       assert(tier == NextcloudMirrorTier.view || sidecarSizeBytes == 0, 'only a view row has a sidecar'),
+       assert(sidecarSizeBytes <= localSizeBytes, 'the sidecar is a share of the local bytes');
 
   // whether this row can answer a requirement for `wanted`; see `NextcloudMirrorTier`
   bool satisfies(NextcloudMirrorTier wanted) => tier.index >= wanted.index;
+
+  // the row's bytes in each budget class, see `NextcloudBudgetClass`
+  int get syncClassBytes => tier == NextcloudMirrorTier.view ? sidecarSizeBytes : localSizeBytes;
+
+  int get viewClassBytes => tier == NextcloudMirrorTier.view ? localSizeBytes - sidecarSizeBytes : 0;
 
   // The row this one becomes when the budget takes its bytes back: no file, no local bytes, the same
   // identity (path, etag, file id, remote size and date), and the reason recorded so a later run knows
@@ -108,11 +146,28 @@ class NextcloudMirrorIndexEntry {
     lastAccessAt: lastAccessAt,
   );
 
+  // The row a `view` row becomes when the budget takes the view bytes back and the grid sidecar is put in
+  // their place: the same identity, `grid`, and the sidecar's size as read back from disk. Not a placeholder:
+  // the item still has its thumbnail, so nothing is a gap and no run has anything to come back for.
+  NextcloudMirrorIndexEntry asGrid({required int localSizeBytes}) => NextcloudMirrorIndexEntry(
+    relativePath: relativePath,
+    etag: etag,
+    fileId: fileId,
+    tier: NextcloudMirrorTier.grid,
+    remoteSizeBytes: remoteSizeBytes,
+    localSizeBytes: localSizeBytes,
+    pinned: pinned,
+    remoteLastModified: remoteLastModified,
+    downloadedAt: downloadedAt,
+    lastAccessAt: lastAccessAt,
+  );
+
   // `tier` and `placeholderReason` are deliberately not here: they change together or not at all, and
-  // `asUnfundedPlaceholder` is the one transition the store makes.
+  // `asUnfundedPlaceholder` and `asGrid` are the two transitions the store makes.
   NextcloudMirrorIndexEntry copyWith({
     int? remoteSizeBytes,
     int? localSizeBytes,
+    int? sidecarSizeBytes,
     bool? pinned,
     DateTime? lastAccessAt,
   }) {
@@ -124,6 +179,7 @@ class NextcloudMirrorIndexEntry {
       placeholderReason: placeholderReason,
       remoteSizeBytes: remoteSizeBytes ?? this.remoteSizeBytes,
       localSizeBytes: localSizeBytes ?? this.localSizeBytes,
+      sidecarSizeBytes: sidecarSizeBytes ?? this.sidecarSizeBytes,
       pinned: pinned ?? this.pinned,
       remoteLastModified: remoteLastModified,
       downloadedAt: downloadedAt,
@@ -138,38 +194,61 @@ class NextcloudMirrorIndexEntry {
   int get hashCode => relativePath.hashCode;
 
   @override
-  String toString() => '$runtimeType{path=$relativePath, etag=$etag, tier=${tier.name}${placeholderReason == null ? '' : '/${placeholderReason!.name}'}, local=$localSizeBytes, remote=$remoteSizeBytes, pinned=$pinned}';
+  String toString() =>
+      '$runtimeType{path=$relativePath, etag=$etag, tier=${tier.name}${placeholderReason == null ? '' : '/${placeholderReason!.name}'}, local=$localSizeBytes${sidecarSizeBytes == 0 ? '' : ' (sidecar $sidecarSizeBytes)'}, remote=$remoteSizeBytes, pinned=$pinned}';
 }
 
-// What one eviction pass did. Separate outcomes because the caller has to do opposite things with them:
-// a removed path loses its gallery entry, a demoted one keeps it and has it refreshed.
+// What one eviction pass did. Separate outcomes because the caller has to do different things with them:
+// a removed path loses its gallery entry, a demoted one keeps it with no bytes behind it, and one demoted
+// to grid keeps it with its thumbnail bytes back in place and must have it read again.
 class NextcloudEvictionOutcome {
-  final Set<String> removed, demoted;
+  // `demoted`: the row survives as an `unfunded` placeholder. `demotedToGrid`: a `view` row survives as a
+  // `grid` row, its sidecar renamed back into place. Two sets rather than one with a tier each, so that a
+  // caller cannot hand a grid demotion to the placeholder path, which would evict the thumbnail it just kept.
+  final Set<String> removed, demoted, demotedToGrid;
 
-  const new({this.removed = const {}, this.demoted = const {}});
+  const new({this.removed = const {}, this.demoted = const {}, this.demotedToGrid = const {}});
 
   static const none = NextcloudEvictionOutcome();
 
-  bool get isEmpty => removed.isEmpty && demoted.isEmpty;
+  bool get isEmpty => removed.isEmpty && demoted.isEmpty && demotedToGrid.isEmpty;
 
   // every path this pass touched, for callers that only need to know whether their own fetch survived
-  Set<String> get touched => {...removed, ...demoted};
+  Set<String> get touched => {...removed, ...demoted, ...demotedToGrid};
 
   @override
-  String toString() => '$runtimeType{removed=${removed.length}, demoted=${demoted.length}}';
+  String toString() => '$runtimeType{removed=${removed.length}, demoted=${demoted.length}, demotedToGrid=${demotedToGrid.length}}';
 }
 
 // Which rows `evictToFit` takes first. The two callers want different answers and neither order is right
 // for the other, so the choice is explicit rather than a property of the store.
 //
-// - `leastRecentlyAccessed`: for a user-driven fetch (an explicit download, a view-tier fetch). What the
-//   user looked at last stays.
-// - `oldestFirst`: for the sync, which fetches newest first. An access-ordered evictor can take precisely
-//   the file the sync is about to fetch again, which is a treadmill no placeholder rule closes. Taking
-//   the oldest `remoteLastModified` first, originals before grid rows, makes the held set a function of
-//   (server order, sizes, budget) and so the same on every run. See `NextcloudSyncFunding` for the bound
-//   that keeps a fetch from evicting anything it would rank above.
-enum NextcloudEvictionOrder { leastRecentlyAccessed, oldestFirst }
+// Each order works one budget class (`NextcloudBudgetClass`), and that is what keeps the two evictors
+// from ever fighting over a row: they never share one.
+//
+// - `leastRecentlyAccessed`: the `sync` class, for an explicit download, which the user asked for whole.
+//   Any unpinned row can go; what the user looked at last stays.
+// - `oldestFirst`: the `sync` class, for the sync, which fetches newest first. An access-ordered evictor
+//   can take precisely the file the sync is about to fetch again, which is a treadmill no placeholder rule
+//   closes. Taking the oldest `remoteLastModified` first, originals before grid rows, makes the held set a
+//   function of (server order, sizes, budget) and so the same on every run. See `NextcloudSyncFunding`
+//   for the bound that keeps a fetch from evicting anything it would rank above.
+// - `viewRowsLeastRecentlyAccessed`: the `view` class, for a view-tier fetch. Only the view bytes of other
+//   `view` rows can go, least recently accessed first, back to their grid bytes; the fetch is refused when
+//   they do not make room. Browsing therefore never costs the gallery a thumbnail or an offline video, and
+//   a sync that still has something to fund never turns the view tier's room into a held original.
+//
+// A `view` row sits in both classes: its view bytes are the `view` class and its sidecar is the `sync`
+// class. The sync orders see it only as the grid bytes it holds, in the grid page, and take it to a
+// placeholder like any grid row; the view order sees only its view bytes.
+enum NextcloudEvictionOrder { leastRecentlyAccessed, viewRowsLeastRecentlyAccessed, oldestFirst }
+
+extension NextcloudEvictionOrderClass on NextcloudEvictionOrder {
+  NextcloudBudgetClass get budgetClass => switch (this) {
+    NextcloudEvictionOrder.leastRecentlyAccessed || NextcloudEvictionOrder.oldestFirst => NextcloudBudgetClass.sync,
+    NextcloudEvictionOrder.viewRowsLeastRecentlyAccessed => NextcloudBudgetClass.view,
+  };
+}
 
 // The item a sync is making room for, under `NextcloudEvictionOrder.oldestFirst`. It bounds the victims:
 //
@@ -200,6 +279,14 @@ class NextcloudSyncFunding {
 // same mechanism as the vault root) and `relativePath` keeps the remote directory tree verbatim.
 // Because `AvesEntry.directory` is derived from `path`, each remote sub-folder becomes a nested album for free.
 abstract class NextcloudMirrorStore {
+  // Where the grid sidecars of `view` rows live: `<mirrorRoot>/<sidecarsDirName>/<account.mirrorDirName>/
+  // <relativePath>`, a sibling of the account directories rather than a name beside the file. The server
+  // can name a file anything a path segment allows (`notes.grid` is a legal Nextcloud file), and a mirror
+  // that refused such a name would report the item as failed, which withholds every ancestor's etag and
+  // walks the whole tree on every run for as long as the file exists. A namespace the server cannot reach
+  // has no such name. An account whose id is this name is refused, as an unsafe id is.
+  static const sidecarsDirName = 'sidecars';
+
   Future<void> init();
 
   String get mirrorRoot;
@@ -207,8 +294,16 @@ abstract class NextcloudMirrorStore {
   // absolute local path for a remote item; does not touch the filesystem
   String localPathFor(NextcloudAccount account, String relativePath);
 
+  // absolute local path of the grid sidecar a `view` row keeps for `relativePath`; does not touch the filesystem
+  String sidecarPathFor(NextcloudAccount account, String relativePath);
+
   // inverse of `localPathFor`; `null` when `localPath` is not under this account's mirror
   String? relativePathFor(NextcloudAccount account, String localPath);
+
+  // The id of the account whose mirror `localPath` is under, read from the layout (`mirrorDirName` is the
+  // account id), or `null` when it is not under any account's mirror. The layout knowledge stays here, so
+  // a caller holding an entry's path need not try every account; it does not check that the account exists.
+  String? accountIdFor(String localPath);
 
   Future<NextcloudMirrorIndexEntry?> lookup(NextcloudAccount account, String relativePath);
 
@@ -231,18 +326,33 @@ abstract class NextcloudMirrorStore {
   // does for `evictToFit`'s `demoted`. Any other tier without its bytes on disk is a
   // `NextcloudNotFoundFailure`, because recording a row for a file that is not there would make `usedBytes`
   // lie forever.
+  //
+  // A `NextcloudMirrorTier.view` row requires its grid sidecar on disk too (`sidecarPathFor`):
+  // `localSizeBytes` is the sum of both files and `sidecarSizeBytes` the sidecar's share, both read back.
+  // The sidecar is what makes the row demotable offline, so a view row without one is the same failure as
+  // a row without its file. Every other tier deletes a stale sidecar for the path, before the row is
+  // written, so bytes a previous view row left behind are never counted by nothing.
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry);
 
-  // deletes the file and its index row; a no-op for unknown paths
+  // deletes the file, its sidecar and its index row; a no-op for unknown paths
   Future<void> remove(NextcloudAccount account, String relativePath);
 
   Future<void> touch(NextcloudAccount account, String relativePath, DateTime accessedAt);
 
-  // Sum of `localSizeBytes` over the account's rows: bytes on disk, never remote sizes.
-  Future<int> usedBytes(NextcloudAccount account);
+  // Sum of `localSizeBytes` over the account's rows: bytes on disk, never remote sizes. With `of`, the
+  // bytes of that budget class only (`NextcloudMirrorIndexEntry.syncClassBytes` / `viewClassBytes`).
+  // Without, the whole mirror, which is what disk reconciliation compares against and **never a budget**:
+  // a budget question is asked of `freeBytes`, which binds the class's sum to the class's limit.
+  Future<int> usedBytes(NextcloudAccount account, {NextcloudBudgetClass? of});
 
-  // Gives bytes back until `usedBytes <= account.cacheLimitBytes - reserveBytes`, in the given `order`
-  // (and, for `oldestFirst`, within the bound `funding` sets; see both types).
+  // `of.limitFor(account) - usedBytes(account, of: of)`: negative when the class is over its limit (a
+  // lowered limit, or the partition landing on a mirror built before it).
+  Future<int> freeBytes(NextcloudAccount account, NextcloudBudgetClass of);
+
+  // Gives bytes back until the `order`'s budget class (`NextcloudEvictionOrder.budgetClass`) fits:
+  // `freeBytes(of) >= reserveBytes` (and, for `oldestFirst`, within the bound `funding` sets; see both
+  // types). The class comes from the order by type and both its limit and its sum from the class, so no
+  // call can pair one class's sum with the other's limit.
   //
   // **Eviction never removes a row.** A victim loses its file and keeps its row as an `unfunded`
   // placeholder (`NextcloudMirrorIndexEntry.asUnfundedPlaceholder`), reported in `demoted`. One row and one
@@ -250,15 +360,26 @@ abstract class NextcloudMirrorStore {
   // from the grid under budget pressure, the completeness rule would see a listed item with no row, and
   // every later sync would re-list the whole tree and fund the gap by evicting the next row — a treadmill
   // that looks like a working sync. A demotion keeps the row and the item, the item streams on demand,
-  // and the mirror still reflects the server. The `view` tier, when it exists, demotes to `grid` for the
-  // same reason.
+  // and the mirror still reflects the server. Under the view order a `view` row demotes to `grid` for the
+  // same reason: its sidecar is renamed back into place and the row keeps its thumbnail, so nothing is a
+  // gap. A view row whose sidecar is missing cannot, and demotes to a placeholder like any other row.
+  //
+  // A sync order that reaches a `view` row (the grid page, when the grid class alone overflows) takes it
+  // in two steps, each inside its own class: first to `grid`, which gives the view bytes back to the
+  // allowance and leaves an ordinary grid row, then — if the overflow rule still reaches it on its own
+  // terms — to a placeholder. Never straight to a placeholder: that would reclaim allowance bytes to fund
+  // sync work, the one leak the partition could have, and it would make an opened photo more likely to
+  // lose its thumbnail than one never opened. A path that went both ways in one pass is reported in
+  // `demoted` only, since its bytes are gone.
   //
   // - `removed`: the row and its bytes are gone. The caller MUST remove the matching entries from the
   //   collection in the same step, since an entry whose mirror file is gone would be dropped from the DB
   //   on its next refresh. No implementation produces this today; it stays in the contract so that no
   //   caller is written against a return type that can only say "demoted".
-  // - `demoted`: the row survives at a cheaper tier. The caller MUST tell the sink, because the bytes
-  //   behind those entries are gone or changed.
+  // - `demoted`: the row survives as an `unfunded` placeholder. The caller MUST tell the sink, because the
+  //   bytes behind those entries are gone.
+  // - `demotedToGrid`: the row survives as a `grid` row with its sidecar bytes in place. The caller MUST
+  //   tell the sink, because the bytes behind those entries changed.
   //
   // A `pinned` row is never either: the user asked for those bytes, so dropping or shrinking them silently
   // would make an explicit download a lie. Neither is a `placeholder` row: it holds no bytes, so taking it
@@ -270,6 +391,11 @@ abstract class NextcloudMirrorStore {
     NextcloudEvictionOrder order = NextcloudEvictionOrder.leastRecentlyAccessed,
     NextcloudSyncFunding? funding,
   });
+
+  // Deletes every sidecar of the account whose row is not a `view` row: a process that died between the
+  // sidecar rename and the row write leaves one behind, and the row it belongs to is then refilled at grid
+  // by the next sync (`record` at grid drops the sidecar) or never — this is for the latter.
+  Future<void> sweepStraySidecars(NextcloudAccount account);
 
   // removes everything for the account (used on account removal)
   Future<void> purge(NextcloudAccount account);

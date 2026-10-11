@@ -22,7 +22,10 @@ abstract class NextcloudMirrorIndex {
   // them back would give the store a page of candidates that cannot go, which it reads as "the account has
   // nothing left to evict". A placeholder in particular has no bytes to reclaim and is never viewed, so it
   // would sit at the head of this order forever.
-  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit});
+  //
+  // `tiers`, when given, restricts the candidates to those tiers (a view-tier fetch may only spend other
+  // view rows, see `NextcloudEvictionOrder`); `placeholder` is excluded whatever it says.
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit, Set<NextcloudMirrorTier>? tiers});
 
   // Oldest `remoteLastModified` first, at most `limit` rows, among the unpinned rows whose tier is in
   // `tiers` and, when `modifiedBefore` is given, whose `remoteLastModified` is strictly before it. The
@@ -41,6 +44,7 @@ abstract class NextcloudMirrorIndex {
 
   // Sum of `localSizeBytes` over the account's rows: bytes on disk, never remote sizes. Named for the
   // column it sums, because summing `remoteSizeBytes` instead would report a mirror of preview rows as
-  // the size of the whole remote library and evict everything forever.
-  Future<int> sumLocalSizeBytes(NextcloudAccount account);
+  // the size of the whole remote library and evict everything forever. With `of`, the rows' bytes in
+  // that budget class only (`NextcloudMirrorIndexEntry.syncClassBytes` / `viewClassBytes`).
+  Future<int> sumLocalSizeBytes(NextcloudAccount account, {NextcloudBudgetClass? of});
 }

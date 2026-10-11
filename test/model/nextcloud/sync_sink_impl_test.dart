@@ -431,6 +431,64 @@ void main() {
       expect(inCollection(Uri.file(localA).toString()).map((v) => v.id), {placeholderId});
     });
 
+    test('a second put over the same placeholder keeps its row, which a refresh from the file it has not got would drop', () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror, placeholders: _StubPlaceholders(fetched(localB)));
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
+      final placeholderId = db.inserts.single.single.id;
+      expect(db.rows.containsKey(placeholderId), isTrue);
+
+      // the same item comes round again: a `force` run re-puts every placeholder, a relist after a raised
+      // limit re-puts the ones still unfunded, and an etag change on an over-threshold video re-puts that one
+      expect(await sink.putPlaceholder(account, itemFor(relA)), isTrue);
+
+      expect(
+        db.rows.containsKey(placeholderId),
+        isTrue,
+        reason: 'a put with no bytes behind it must not take the file-refresh branch: that drops the row first and writes it back only from a file it can read',
+      );
+      expect(inCollection(uriA).map((v) => v.id), {placeholderId}, reason: 'and the entry stays the same entry, with its favourite and cover');
+      expect(db.removals.where((r) => r.$2 == null || r.$2!.contains(EntryDataType.basic)), isEmpty, reason: 'nothing about a placeholder re-put wants the row gone');
+      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty, reason: 'still never consulted: there are no bytes to read');
+    });
+
+    test("a second put over the same placeholder still carries the server's new properties into the entry and its row", () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      expect(
+        await sink.putPlaceholder(
+          account,
+          itemFor(relA, photoMetadata: const NextcloudPhotoMetadata(width: 100, height: 200, originalDateTime: null, latitude: null, longitude: null)),
+        ),
+        isTrue,
+      );
+      final placeholderId = db.inserts.single.single.id;
+
+      // the server now reports different dimensions and a capture date it did not have before.
+      // `lastModified` is left alone on purpose: a changed file date makes `_onVisualFieldChanged` call
+      // `clearDecoders()`, which the fake services do not implement, and it is not what this test is about.
+      final updated = NextcloudPhotoMetadata(
+        width: 4032,
+        height: 3024,
+        originalDateTime: DateTime.utc(2023, 5, 6, 12),
+        latitude: 35.6895,
+        longitude: 139.6917,
+      );
+      expect(await sink.putPlaceholder(account, itemFor(relA, photoMetadata: updated)), isTrue);
+
+      // not just "the row survived": skipping the refresh outright would also do that, and would leave the
+      // entry describing properties the server has replaced
+      final entry = source.getEntryById(placeholderId)!;
+      expect(entry.width, 4032);
+      expect(entry.height, 3024);
+      expect(entry.catalogMetadata!.dateMillis, updated.originalDateTime!.millisecondsSinceEpoch);
+      expect(entry.catalogMetadata!.latitude, updated.latitude);
+      final persisted = db.rows[placeholderId]!;
+      expect(persisted.width, 4032, reason: 'and the row the next launch reads says the same');
+      expect(persisted.height, 3024);
+      expect(db.updates.map((u) => u.$1), contains(placeholderId), reason: 'persisted by update, not by delete-and-write-back');
+    });
+
     test('a builder that cannot make an entry is a refusal, not a failure', () async {
       source = await initSource();
       sink = NextcloudCollectionSyncSink(source, mirror, placeholders: const _StubPlaceholders(null));

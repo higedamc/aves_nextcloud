@@ -32,6 +32,10 @@ import 'package:aves/model/nextcloud/sync_ports.dart';
 //   unchanged-root fast path) rests on Nextcloud propagating every etag change to all ancestors: the promise
 //   only stays true because any later change under it bumps it. Against a WebDAV server that does not
 //   propagate, this is silently stale.
+// - The sync, and a pinned download, fund against `account.syncBudgetBytes` and the `sync` class of
+//   bytes; opening an item funds the `view` tier against `account.viewAllowanceBytes` and the `view`
+//   class, see `NextcloudBudgetClass`. Neither can spend the other's bytes, which is what keeps browsing
+//   from costing the gallery a thumbnail and the sync from eating the view tier's room.
 // - Downloads go the whole grid class first, then originals, newest first within each, and the budget's
 //   eviction may only take rows the sync ranks below the item it is funding (`NextcloudSyncFunding`). An
 //   item the budget cannot fund gets an `unfunded` placeholder row — in the gallery, streamed on demand —
@@ -94,6 +98,11 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     });
   }
 
+  @override
+  Future<NextcloudFailure?> fetchView(NextcloudAccount account, String relativePath, {NextcloudCancellation? cancellation}) {
+    return _enqueue(account, () => _fetchView(account, relativePath, cancellation));
+  }
+
   // a task for the same account waits for the previous one, whatever its outcome
   Future<T> _enqueue<T>(NextcloudAccount account, Future<T> Function() task) {
     final accountId = account.id;
@@ -122,17 +131,19 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           if (!existing.pinned) await _mirror.record(account, existing.copyWith(pinned: true, lastAccessAt: _now()));
           return null;
         }
-        // net of the bytes already held at this path, which the download replaces (see `_download`)
-        final reserve = math.max(0, item.sizeBytes - (existing?.localSizeBytes ?? 0));
-        if (item.sizeBytes > account.cacheLimitBytes) {
-          throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.cacheLimitBytes);
+        // Net of the bytes already held at this path, which the download replaces (see `_download`). A pin
+        // is machine work's side of the partition: it funds against the sync budget, never the allowance,
+        // or one pinned video would eat the view tier's room whole (`NextcloudBudgetClass`).
+        final reserve = math.max(0, item.sizeBytes - (existing?.syncClassBytes ?? 0));
+        if (item.sizeBytes > account.syncBudgetBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: item.sizeBytes, availableBytes: account.syncBudgetBytes);
         }
         final stats = _Stats();
         final eviction = await _mirror.evictToFit(account, reserveBytes: reserve);
         if (!eviction.isEmpty) await _applyEviction(account, eviction, stats);
-        final used = await _mirror.usedBytes(account);
-        if (used + reserve > account.cacheLimitBytes) {
-          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.cacheLimitBytes - used);
+        final free = await _mirror.freeBytes(account, NextcloudBudgetClass.sync);
+        if (reserve > free) {
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: free);
         }
         final localPath = _mirror.localPathFor(account, path);
         final observedEtag = await repository.downloadTo(item, localPath, cancellation: cancellation);
@@ -166,6 +177,76 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     }
   }
 
+  // Opening an item. The access is recorded first and whatever follows: it is what the view order evicts
+  // by. Then a grid row is promoted to the view tier inside the allowance: the grid bytes move aside as
+  // the sidecar before the view bytes take their place, so the row is demotable offline from the moment
+  // it is written. Nothing else is touched: a placeholder has no bytes to improve on, a view or original
+  // row is already better, and an item that changed on the server is the sync's to refresh — a view of
+  // the new bytes over a sidecar of the old ones would be a row whose two files disagree.
+  Future<NextcloudFailure?> _fetchView(NextcloudAccount account, String relativePath, NextcloudCancellation? cancellation) async {
+    try {
+      final existing = await _mirror.lookup(account, relativePath);
+      if (existing == null) return null;
+      await _mirror.touch(account, relativePath, _now());
+      if (existing.tier != NextcloudMirrorTier.grid) return null;
+      _checkCancelled(cancellation);
+      final credentials = await _credentials.credentialsFor(account);
+      if (credentials == null) throw const NextcloudAuthFailure(0);
+      final repository = _repositories.open(account, credentials);
+      try {
+        final item = await repository.stat(relativePath);
+        if (item.isCollection || !item.isImage || item.etag != existing.etag) return null;
+        final path = item.relativePath;
+        // the grid bytes stay as the sidecar, so nothing is netted: the whole reservation is new
+        final reserve = _reserveFor(item, NextcloudMirrorTier.view);
+        if (reserve > account.viewAllowanceBytes) {
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: account.viewAllowanceBytes);
+        }
+        final stats = _Stats();
+        final eviction = await _mirror.evictToFit(account, reserveBytes: reserve, order: NextcloudEvictionOrder.viewRowsLeastRecentlyAccessed);
+        if (!eviction.isEmpty) await _applyEviction(account, eviction, stats);
+        final free = await _mirror.freeBytes(account, NextcloudBudgetClass.view);
+        if (reserve > free) {
+          // the allowance says no: the viewer keeps the grid bytes, and nothing sync-held was touched
+          throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: free);
+        }
+        _checkCancelled(cancellation);
+        final bytes = await repository.fetchPreview(item, width: viewEdgePx, height: viewEdgePx);
+        _checkCancelled(cancellation);
+        final localPath = _mirror.localPathFor(account, path);
+        await _writeThrough(localPath, bytes, modified: item.lastModified, keepExistingAs: _mirror.sidecarPathFor(account, path));
+        final now = _now();
+        await _mirror.record(
+          account,
+          NextcloudMirrorIndexEntry(
+            relativePath: path,
+            // the preview endpoint answers for the file as listed, which `stat` just confirmed is this etag
+            etag: existing.etag,
+            fileId: item.fileId,
+            tier: NextcloudMirrorTier.view,
+            remoteSizeBytes: item.sizeBytes,
+            // the store reads both files back; the sidecar is not known here
+            localSizeBytes: bytes.length,
+            pinned: existing.pinned,
+            remoteLastModified: item.lastModified,
+            downloadedAt: now,
+            lastAccessAt: now,
+          ),
+        );
+        if (!await _sink.putMirroredFile(account, item, localPath, NextcloudMirrorTier.view)) {
+          // the entry could not be read from the new bytes: drop them so the next sync refills the row at grid
+          await _mirror.remove(account, path);
+          throw NextcloudLocalStorageFailure('could not refresh the entry for $path');
+        }
+        return null;
+      } finally {
+        repository.dispose();
+      }
+    } on NextcloudFailure catch (e) {
+      return e;
+    }
+  }
+
   Future<NextcloudSyncResult> _run(NextcloudSyncRequest request, void Function(NextcloudSyncProgress) emit) async {
     final account = request.account;
     final cancellation = request.cancellation;
@@ -182,6 +263,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         await repository.probe();
         _checkCancelled(cancellation);
         await _sweepPartFiles(account);
+        await _mirror.sweepStraySidecars(account);
 
         final state = await _states.load(account);
         // A raised limit of either kind can turn a skipped item into a wanted one, and an item under a subtree
@@ -357,18 +439,25 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     };
   }
 
-  // The tier a run fetches: the wanted one, unless the row already holds more. A `force` run re-fetches
-  // every listed item, and it must re-fetch what is held rather than what is wanted, or forcing would
-  // silently downgrade every original (every row migrated from v1) to a preview.
+  // The tier a run fetches: the wanted one, unless the row holds an original. A `force` run re-fetches
+  // every listed item, and it must re-fetch a held original rather than what is wanted, or forcing would
+  // silently downgrade every original (every row migrated from v1) to a preview. That reason does not
+  // reach a held `view` row: the sync never fetches the view tier (it is browsing's, fetched at its own
+  // edge inside its own allowance), so a changed or forced view row is re-fetched at grid, the sidecar
+  // goes with the row, and the next open fetches the view again.
   static NextcloudMirrorTier _fetchTier(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing) {
     final wanted = _wantedTier(account, item);
-    if (existing != null && existing.tier.index > wanted.index) return existing.tier;
+    if (existing != null && existing.tier == NextcloudMirrorTier.original) return existing.tier;
     return wanted;
   }
 
   // Long edge requested for the grid tier. Fixed, not keyed to the column count, which is a live
   // pinch-to-zoom setting: a tier that followed it would refetch the library on a pinch.
   static const gridEdgePx = 256;
+
+  // Long edge of the view tier: the `x=1024` bucket, 768x1024 at a measured mean of 135 KB, which fills a
+  // phone screen; the next bucket (2048) costs 2.5x for little the screen can show.
+  static const viewEdgePx = 1024;
 
   // Reservation ceilings for derivative tiers. A derivative's byte size is unknowable before the fetch, so
   // the budget reserves a ceiling and then accounts the size the store read back from disk. The ceilings
@@ -444,10 +533,10 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
       // the next-newest to make room it does not need, and the held set would stop being a function of
       // the server's order. The old bytes stay on disk until the rename, so the mirror can briefly exceed
       // the limit by their size; the index never counts a `.part` file, so nothing is misreported.
-      final reserve = math.max(0, _reserveFor(item, tier) - (existing?.localSizeBytes ?? 0));
+      final reserve = math.max(0, _reserveFor(item, tier) - (existing?.syncClassBytes ?? 0));
       try {
         final bool funded;
-        if (_reserveFor(item, tier) > account.cacheLimitBytes) {
+        if (_reserveFor(item, tier) > account.syncBudgetBytes) {
           // Never empty the whole mirror for a file that cannot fit anyway; says nothing about the rest.
           // The whole reservation, not the netted one: the two numbers answer different questions. Netted,
           // a grown file whose own row is the only candidate of its own pass would have that row demoted,
@@ -470,16 +559,17 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
             // run ranks above this item, and a pass may only take what ranks below it
             assert(!eviction.touched.any(fetchedThisRun.contains), 'the store evicted a row this run fetched: $eviction');
           }
-          final used = await _mirror.usedBytes(account);
-          funded = used + reserve <= account.cacheLimitBytes;
-          if (!funded) free = account.cacheLimitBytes - used;
+          // the sync class against the sync budget, bound together by the store so the pairing cannot slip
+          final freeNow = await _mirror.freeBytes(account, NextcloudBudgetClass.sync);
+          funded = reserve <= freeNow;
+          if (!funded) free = freeNow;
         }
         if (!funded) {
           if (existing != null && existing.pinned) {
             // The user asked for these bytes, so neither the row nor the file may be demoted for a change
             // the budget cannot fund: the pinned original stays as it is, and the refusal stays loud, as it
             // was before placeholders existed. The etag is withheld for it, which is the honest outcome.
-            throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: free ?? account.cacheLimitBytes - await _mirror.usedBytes(account));
+            throw NextcloudQuotaFailure(requiredBytes: reserve, availableBytes: free ?? await _mirror.freeBytes(account, NextcloudBudgetClass.sync));
           }
           // The budget said no: the item is still listed, so it gets a row and an entry, streamed on
           // demand, and the reason is recorded so a raised budget knows to come back for it. Not a quota
@@ -511,6 +601,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
           );
           localBytes = item.sizeBytes;
         } else {
+          // the only derivative the sync fetches; `_fetchTier` is what keeps `view` out of this loop
+          assert(tier == NextcloudMirrorTier.grid, 'the sync fetches derivatives at grid only, got $tier');
           final Uint8List bytes;
           try {
             bytes = await repository.fetchPreview(item, width: gridEdgePx, height: gridEdgePx);
@@ -557,7 +649,7 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
         }
         fetchedThisRun.add(path);
         // accounted after the fetch, with the bytes that landed as the store read them, not the reservation
-        if (free != null) free = account.cacheLimitBytes - await _mirror.usedBytes(account);
+        if (free != null) free = await _mirror.freeBytes(account, NextcloudBudgetClass.sync);
         if (existing == null) {
           stats.added++;
         } else {
@@ -621,12 +713,21 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   // leaves a `.part` for the sweep and never a half-written file under a path the index could trust. The
   // mtime is the server's for the same reason as there: a preview carries no Exif, so the file date is the
   // only date the entry has until the catalogue learns it from the properties.
-  Future<void> _writeThrough(String localPath, List<int> bytes, {required DateTime modified}) async {
+  //
+  // With `keepExistingAs`, the file already at `localPath` is moved there right before the new bytes take
+  // its place (a view fetch keeping the grid bytes as its sidecar). A crash between the two renames leaves
+  // the path empty and the sidecar in place: a cache miss the next sync refills at grid, which drops the
+  // sidecar. A missing file to keep is a failure, not a silent promotion: the row said the bytes were there.
+  Future<void> _writeThrough(String localPath, List<int> bytes, {required DateTime modified, String? keepExistingAs}) async {
     final target = File(localPath);
     final part = File('$localPath.part');
     await target.parent.create(recursive: true);
     try {
       await part.writeAsBytes(bytes, flush: true);
+      if (keepExistingAs != null) {
+        await File(keepExistingAs).parent.create(recursive: true);
+        await target.rename(keepExistingAs);
+      }
       await part.rename(localPath);
     } catch (e) {
       if (await part.exists()) await part.delete();
@@ -670,8 +771,15 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
     await _applyEviction(account, eviction, stats);
   }
 
-  // Every eviction site goes through here so the two outcomes cannot be handled differently by accident.
+  // Every eviction site goes through here so the outcomes cannot be handled differently by accident.
   Future<void> _applyEviction(NextcloudAccount account, NextcloudEvictionOutcome eviction, _Stats stats) async {
+    if (eviction.demotedToGrid.isNotEmpty) {
+      // the rows survive as grid rows with their thumbnails in place: the entries stay and are read again
+      // from the grid bytes. Counted as demoted — bytes went back — and never as evicted, for the reason
+      // below: nothing left the mirror and no item is a gap, so no etag is a lie.
+      await _sink.demoteToGrid(account, eviction.demotedToGrid);
+      stats.demoted += eviction.demotedToGrid.length;
+    }
     if (eviction.demoted.isNotEmpty) {
       // the rows survive as unfunded placeholders: the entries stay, and the sink drops what described
       // their bytes

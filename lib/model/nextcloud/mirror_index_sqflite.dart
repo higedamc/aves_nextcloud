@@ -11,7 +11,7 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
   late Database _db;
 
   static const _fileName = 'nextcloud_mirror.db';
-  static const _version = 3;
+  static const _version = 4;
   static const table = 'mirrorEntry';
 
   Future<String> get path async => pContext.join(await getDatabasesPath(), _fileName);
@@ -42,6 +42,7 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
       , placeholderReason TEXT
       , remoteSizeBytes INTEGER NOT NULL
       , localSizeBytes INTEGER NOT NULL
+      , sidecarSizeBytes INTEGER NOT NULL DEFAULT 0
       , pinned INTEGER NOT NULL
       , remoteLastModified INTEGER NOT NULL
       , downloadedAt INTEGER NOT NULL
@@ -93,6 +94,12 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
       await db.update(table, {'placeholderReason': NextcloudPlaceholderReason.policy.name}, where: 'tier = ?', whereArgs: [NextcloudMirrorTier.placeholder.name]);
       await db.execute('CREATE INDEX ${table}_remoteLastModified ON $table(accountId, remoteLastModified)');
     }
+    if (oldVersion >= 2 && oldVersion < 4) {
+      // v4 adds the sidecar's share of a view row's bytes. Defaulted, so an in-place add is fine (the v2
+      // lesson was `NOT NULL` with no default), and 0 is a fact about every existing row: no binary
+      // before this version wrote a view row.
+      await db.execute('ALTER TABLE $table ADD COLUMN sidecarSizeBytes INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   @override
@@ -114,7 +121,7 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
   }
 
   @override
-  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit, Set<NextcloudMirrorTier>? tiers}) async {
     // served by the `lastAccessAt` index, so a page costs the page, not the account.
     // `relativePath` breaks ties: a bulk download gives a whole album the same `lastAccessAt`, and
     // without a total order successive pages could repeat or skip rows.
@@ -128,10 +135,16 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
     // would sit at the head of this very order — the first eviction would take every above-threshold video
     // and every image without a preview, the next sync would re-list and recreate them, and the cycle
     // would repeat on every eviction.
+    //
+    // With `tiers`, the placeholder exclusion is kept rather than left to the caller's set, for the same
+    // reason as in `getOldestModified`: a caller that passed it would get a page that cannot go.
+    final wanted = tiers?.where((tier) => tier != NextcloudMirrorTier.placeholder).toList();
+    if (wanted != null && wanted.isEmpty) return const [];
+    final tierClause = wanted == null ? 'tier != ?' : 'tier IN (${List.filled(wanted.length, '?').join(', ')})';
     final rows = await _db.query(
       table,
-      where: 'accountId = ? AND pinned = 0 AND tier != ?',
-      whereArgs: [account.id, NextcloudMirrorTier.placeholder.name],
+      where: 'accountId = ? AND pinned = 0 AND $tierClause',
+      whereArgs: [account.id, if (wanted == null) NextcloudMirrorTier.placeholder.name else ...wanted.map((tier) => tier.name)],
       orderBy: 'lastAccessAt ASC, relativePath ASC',
       limit: limit,
     );
@@ -170,6 +183,7 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
         'placeholderReason': entry.placeholderReason?.name,
         'remoteSizeBytes': entry.remoteSizeBytes,
         'localSizeBytes': entry.localSizeBytes,
+        'sidecarSizeBytes': entry.sidecarSizeBytes,
         'pinned': entry.pinned ? 1 : 0,
         'remoteLastModified': entry.remoteLastModified.millisecondsSinceEpoch,
         'downloadedAt': entry.downloadedAt.millisecondsSinceEpoch,
@@ -190,8 +204,16 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
   }
 
   @override
-  Future<int> sumLocalSizeBytes(NextcloudAccount account) async {
-    final rows = await _db.rawQuery('SELECT SUM(localSizeBytes) AS total FROM $table WHERE accountId = ?', [account.id]);
+  Future<int> sumLocalSizeBytes(NextcloudAccount account, {NextcloudBudgetClass? of}) async {
+    // the same split as `NextcloudMirrorIndexEntry.syncClassBytes` / `viewClassBytes`, in SQL: a view row
+    // counts its sidecar for the sync class and the rest for the view class, every other row is sync
+    final view = NextcloudMirrorTier.view.name;
+    final expression = switch (of) {
+      null => 'localSizeBytes',
+      NextcloudBudgetClass.sync => "CASE WHEN tier = '$view' THEN sidecarSizeBytes ELSE localSizeBytes END",
+      NextcloudBudgetClass.view => "CASE WHEN tier = '$view' THEN localSizeBytes - sidecarSizeBytes ELSE 0 END",
+    };
+    final rows = await _db.rawQuery('SELECT SUM($expression) AS total FROM $table WHERE accountId = ?', [account.id]);
     // SUM over no rows is null, not 0
     return (rows.isEmpty ? null : rows.first['total'] as int?) ?? 0;
   }
@@ -206,6 +228,8 @@ class SqfliteNextcloudMirrorIndex implements NextcloudMirrorIndex {
       placeholderReason: tier == NextcloudMirrorTier.placeholder ? _reasonFrom(row['placeholderReason']) : null,
       remoteSizeBytes: row['remoteSizeBytes'] as int,
       localSizeBytes: row['localSizeBytes'] as int,
+      // only a view row may carry a sidecar; a row from a newer binary read as a placeholder must not
+      sidecarSizeBytes: tier == NextcloudMirrorTier.view ? (row['sidecarSizeBytes'] as int? ?? 0) : 0,
       pinned: (row['pinned'] as int? ?? 0) != 0,
       remoteLastModified: DateTime.fromMillisecondsSinceEpoch(row['remoteLastModified'] as int),
       downloadedAt: DateTime.fromMillisecondsSinceEpoch(row['downloadedAt'] as int),

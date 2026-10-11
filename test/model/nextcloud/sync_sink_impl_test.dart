@@ -521,6 +521,55 @@ void main() {
       expect(db.updates.length, updatesBefore);
     });
   });
+
+  group('demoteToGrid', () {
+    test('an entry whose view bytes went back stays, is read again from its grid bytes for size and shape only, and is told its look changed', () async {
+      db.rows[1] = row(localA, id: 1);
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      final entry = source.getEntryById(1)!;
+      var visualChanges = 0;
+      entry.visualChangeNotifier.addListener(() => visualChanges++);
+      // the grid bytes are in place again, as the store leaves them
+      await File(localA).parent.create(recursive: true);
+      await File(localA).writeAsBytes([1, 2, 3]);
+      (mediaFetchService as FakeMediaFetchService).entries = {fetched(localA, sizeBytes: 3)};
+      final removalsBefore = db.removals.length;
+
+      await sink.demoteToGrid(account, {relA});
+
+      expect(source.getEntryById(1), same(entry));
+      expect(inCollection(uriA).map((e) => e.id), [1]);
+      expect(entry.sizeBytes, 3, reason: 'what the bytes decide');
+      expect(db.rows.keys, {1});
+      // `basic` and `aspectRatio` only: the catalogue came from the server and the bytes cannot replace it
+      final refreshed = db.removals.skip(removalsBefore).map((removal) => removal.$2).toList();
+      expect(refreshed, isNotEmpty);
+      for (final dataTypes in refreshed) {
+        expect(dataTypes, isNot(contains(EntryDataType.catalog)));
+        expect(dataTypes, isNot(contains(EntryDataType.address)));
+      }
+      expect(visualChanges, 1);
+      await File(localA).delete();
+    });
+
+    test('a path whose file is gone after all is not read, and a path with no entry is skipped', () async {
+      db.rows[1] = row(localA, id: 1);
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      final entry = source.getEntryById(1)!;
+      var visualChanges = 0;
+      entry.visualChangeNotifier.addListener(() => visualChanges++);
+      final removalsBefore = db.removals.length, updatesBefore = db.updates.length;
+
+      await sink.demoteToGrid(account, {relA, relB});
+
+      expect(db.removals.length, removalsBefore);
+      expect(db.updates.length, updatesBefore);
+      expect(visualChanges, 1, reason: 'the cached images are still dropped: they decode bytes that are not there');
+      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+    });
+  });
 }
 
 // A stand-in for the leaf that will synthesise entries without local bytes.

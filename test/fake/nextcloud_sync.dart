@@ -233,7 +233,9 @@ class FakeNextcloudCredentialStore extends NextcloudCredentialStore {
 }
 
 // Mirror store over a temp directory with in-memory rows; the same policy as the real one where the
-// sync depends on it: `record` reads the size from disk, `remove` deletes file then row, eviction is LRU.
+// sync depends on it: `record` reads the size from disk (both files for a view row), `remove` deletes
+// files then row, eviction works one budget class per order and demotes rather than removes, and the
+// sidecars live apart from the mirror tree.
 class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   @override
   final String mirrorRoot;
@@ -248,14 +250,33 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   @override
   Future<void> init() async {}
 
+  String _accountRoot(NextcloudAccount account) => '$mirrorRoot${Platform.pathSeparator}${account.mirrorDirName}';
+
+  String _sidecarRoot(NextcloudAccount account) => '$mirrorRoot${Platform.pathSeparator}${NextcloudMirrorStore.sidecarsDirName}${Platform.pathSeparator}${account.mirrorDirName}';
+
+  String _join(String root, String relativePath) => relativePath.isEmpty ? root : '$root${Platform.pathSeparator}${relativePath.split(NextcloudPaths.separator).join(Platform.pathSeparator)}';
+
   @override
-  String localPathFor(NextcloudAccount account, String relativePath) {
-    final root = '$mirrorRoot${Platform.pathSeparator}${account.mirrorDirName}';
-    return relativePath.isEmpty ? root : '$root${Platform.pathSeparator}${relativePath.split(NextcloudPaths.separator).join(Platform.pathSeparator)}';
+  String localPathFor(NextcloudAccount account, String relativePath) => _join(_accountRoot(account), relativePath);
+
+  @override
+  String sidecarPathFor(NextcloudAccount account, String relativePath) => _join(_sidecarRoot(account), relativePath);
+
+  @override
+  String? relativePathFor(NextcloudAccount account, String localPath) {
+    final prefix = '${_accountRoot(account)}${Platform.pathSeparator}';
+    if (!localPath.startsWith(prefix)) return null;
+    return localPath.substring(prefix.length).split(Platform.pathSeparator).join(NextcloudPaths.separator);
   }
 
   @override
-  String? relativePathFor(NextcloudAccount account, String localPath) => throw UnimplementedError();
+  String? accountIdFor(String localPath) {
+    final prefix = '$mirrorRoot${Platform.pathSeparator}';
+    if (!localPath.startsWith(prefix)) return null;
+    final segments = localPath.substring(prefix.length).split(Platform.pathSeparator);
+    if (segments.length < 2 || segments.first == NextcloudMirrorStore.sidecarsDirName) return null;
+    return segments.first;
+  }
 
   @override
   Future<NextcloudMirrorIndexEntry?> lookup(NextcloudAccount account, String relativePath) async => rows(account)[relativePath];
@@ -263,15 +284,33 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   @override
   Future<Set<NextcloudMirrorIndexEntry>> listAll(NextcloudAccount account) async => rows(account).values.toSet();
 
+  Future<void> _deleteIfExists(String path) async {
+    final file = File(path);
+    if (await file.exists()) await file.delete();
+  }
+
   @override
   Future<void> record(NextcloudAccount account, NextcloudMirrorIndexEntry entry) async {
-    // same branch as the real store: a placeholder has no file to stat and no bytes to count, and any file
-    // already at the path goes back to the budget
+    // same branches as the real store: a placeholder has no file to stat and no bytes to count, and any
+    // file already at the path (and any sidecar) goes back to the budget; a view row needs its sidecar
+    // and counts both files; every other tier drops a stale sidecar
     final isPlaceholder = entry.tier == NextcloudMirrorTier.placeholder;
     final file = File(localPathFor(account, entry.relativePath));
-    if (isPlaceholder && await file.exists()) await file.delete();
+    final sidecar = File(sidecarPathFor(account, entry.relativePath));
+    if (isPlaceholder) {
+      await _deleteIfExists(file.path);
+      await _deleteIfExists(sidecar.path);
+    }
     final stat = isPlaceholder ? null : await file.stat();
     if (stat != null && stat.type != FileSystemEntityType.file) throw NextcloudNotFoundFailure(entry.relativePath);
+    var sidecarBytes = 0;
+    if (entry.tier == NextcloudMirrorTier.view) {
+      final sidecarStat = await sidecar.stat();
+      if (sidecarStat.type != FileSystemEntityType.file) throw NextcloudNotFoundFailure(entry.relativePath);
+      sidecarBytes = sidecarStat.size;
+    } else if (!isPlaceholder) {
+      await _deleteIfExists(sidecar.path);
+    }
     rows(account)[entry.relativePath] = NextcloudMirrorIndexEntry(
       relativePath: entry.relativePath,
       etag: entry.etag,
@@ -279,7 +318,8 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
       tier: entry.tier,
       placeholderReason: entry.placeholderReason,
       remoteSizeBytes: entry.remoteSizeBytes,
-      localSizeBytes: stat?.size ?? 0,
+      localSizeBytes: (stat?.size ?? 0) + sidecarBytes,
+      sidecarSizeBytes: sidecarBytes,
       pinned: entry.pinned,
       remoteLastModified: entry.remoteLastModified,
       downloadedAt: entry.downloadedAt,
@@ -289,8 +329,8 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
 
   @override
   Future<void> remove(NextcloudAccount account, String relativePath) async {
-    final file = File(localPathFor(account, relativePath));
-    if (await file.exists()) await file.delete();
+    await _deleteIfExists(localPathFor(account, relativePath));
+    await _deleteIfExists(sidecarPathFor(account, relativePath));
     rows(account).remove(relativePath);
   }
 
@@ -301,7 +341,19 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
   }
 
   @override
-  Future<int> usedBytes(NextcloudAccount account) async => rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
+  Future<int> usedBytes(NextcloudAccount account, {NextcloudBudgetClass? of}) async => rows(account).values.fold<int>(
+    0,
+    (sum, v) =>
+        sum +
+        switch (of) {
+          null => v.localSizeBytes,
+          NextcloudBudgetClass.sync => v.syncClassBytes,
+          NextcloudBudgetClass.view => v.viewClassBytes,
+        },
+  );
+
+  @override
+  Future<int> freeBytes(NextcloudAccount account, NextcloudBudgetClass of) async => of.limitFor(account) - await usedBytes(account, of: of);
 
   @override
   Future<NextcloudEvictionOutcome> evictToFit(
@@ -311,51 +363,84 @@ class FakeNextcloudMirrorStore implements NextcloudMirrorStore {
     NextcloudSyncFunding? funding,
   }) async {
     evictCalls.add('${account.id}:$reserveBytes');
-    final target = (account.cacheLimitBytes - reserveBytes).clamp(0, account.cacheLimitBytes);
+    final budgetClass = order.budgetClass;
+    final limit = budgetClass.limitFor(account);
+    final target = (limit - reserveBytes).clamp(0, limit < 0 ? 0 : limit);
     final demoted = <String>{};
-    var used = await usedBytes(account);
-    // mirrors the real store: neither a pinned row nor a placeholder is a candidate
-    final all = rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList();
+    final demotedToGrid = <String>{};
+    var used = await usedBytes(account, of: budgetClass);
     int byPath(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) => a.relativePath.compareTo(b.relativePath);
-    final List<NextcloudMirrorIndexEntry> candidates;
-    switch (order) {
-      case NextcloudEvictionOrder.leastRecentlyAccessed:
-        candidates = all
-          ..sort((a, b) {
-            final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
-            return byAccess != 0 ? byAccess : byPath(a, b);
-          });
-      case NextcloudEvictionOrder.oldestFirst:
-        // same order and bound as the real store: originals (and view rows) before grid rows, oldest
-        // `remoteLastModified` first; an original may only take rows older than itself and never a grid
-        // row, a grid row may take any original and only grid rows older than itself
-        final fundsGrid = funding == null || funding.tier == NextcloudMirrorTier.grid;
-        bool older(NextcloudMirrorIndexEntry v) => funding == null || v.remoteLastModified.isBefore(funding.lastModified);
-        int byDate(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) {
-          final cmp = a.remoteLastModified.compareTo(b.remoteLastModified);
-          return cmp != 0 ? cmp : byPath(a, b);
-        }
+    int byAccess(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) {
+      final cmp = a.lastAccessAt.compareTo(b.lastAccessAt);
+      return cmp != 0 ? cmp : byPath(a, b);
+    }
 
-        final bytes = all.where((v) => v.tier != NextcloudMirrorTier.grid && (fundsGrid || older(v))).toList()..sort(byDate);
-        final grids = fundsGrid ? (all.where((v) => v.tier == NextcloudMirrorTier.grid && older(v)).toList()..sort(byDate)) : const <NextcloudMirrorIndexEntry>[];
-        candidates = [...bytes, ...grids];
+    int byDate(NextcloudMirrorIndexEntry a, NextcloudMirrorIndexEntry b) {
+      final cmp = a.remoteLastModified.compareTo(b.remoteLastModified);
+      return cmp != 0 ? cmp : byPath(a, b);
     }
-    for (final victim in candidates) {
-      if (used <= target) break;
-      // demotion, as in the real store: the file goes, the row stays as an unfunded placeholder
-      final file = File(localPathFor(account, victim.relativePath));
-      if (await file.exists()) await file.delete();
-      rows(account)[victim.relativePath] = victim.asUnfundedPlaceholder();
-      demoted.add(victim.relativePath);
-      used -= victim.localSizeBytes;
+
+    // mirrors the real store: neither a pinned row nor a placeholder is a candidate; the order decides
+    // which tiers and which bound, and a view row taken by a sync order goes to grid first and comes up
+    // again as a grid row (the candidates are re-read after every demotion, as the real store re-queries)
+    List<NextcloudMirrorIndexEntry> candidates() {
+      final all = rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList();
+      switch (order) {
+        case NextcloudEvictionOrder.leastRecentlyAccessed:
+          return all..sort(byAccess);
+        case NextcloudEvictionOrder.viewRowsLeastRecentlyAccessed:
+          return all.where((v) => v.tier == NextcloudMirrorTier.view).toList()..sort(byAccess);
+        case NextcloudEvictionOrder.oldestFirst:
+          final fundsGrid = funding == null || funding.tier == NextcloudMirrorTier.grid;
+          bool older(NextcloudMirrorIndexEntry v) => funding == null || v.remoteLastModified.isBefore(funding.lastModified);
+          final originals = all.where((v) => v.tier == NextcloudMirrorTier.original && (fundsGrid || older(v))).toList()..sort(byDate);
+          final grids = fundsGrid ? (all.where((v) => v.tier != NextcloudMirrorTier.original && older(v)).toList()..sort(byDate)) : const <NextcloudMirrorIndexEntry>[];
+          return [...originals, ...grids];
+      }
     }
-    return NextcloudEvictionOutcome(demoted: demoted);
+
+    while (used > target) {
+      final next = candidates();
+      if (next.isEmpty) break;
+      final victim = next.first;
+      final path = victim.relativePath;
+      final file = File(localPathFor(account, path));
+      final sidecar = File(sidecarPathFor(account, path));
+      if (victim.tier == NextcloudMirrorTier.view && await sidecar.exists()) {
+        await _deleteIfExists(file.path);
+        await sidecar.rename(file.path);
+        rows(account)[path] = victim.asGrid(localSizeBytes: await file.length());
+        demotedToGrid.add(path);
+        if (budgetClass == NextcloudBudgetClass.view) used -= victim.viewClassBytes;
+      } else {
+        await _deleteIfExists(file.path);
+        await _deleteIfExists(sidecar.path);
+        rows(account)[path] = victim.asUnfundedPlaceholder();
+        demoted.add(path);
+        demotedToGrid.remove(path);
+        used -= budgetClass == NextcloudBudgetClass.view ? victim.viewClassBytes : victim.syncClassBytes;
+      }
+    }
+    return NextcloudEvictionOutcome(demoted: demoted, demotedToGrid: demotedToGrid);
+  }
+
+  @override
+  Future<void> sweepStraySidecars(NextcloudAccount account) async {
+    final root = Directory(_sidecarRoot(account));
+    if (!await root.exists()) return;
+    await for (final entity in root.list(recursive: true)) {
+      if (entity is! File) continue;
+      final relativePath = entity.path.substring(root.path.length + 1).split(Platform.pathSeparator).join(NextcloudPaths.separator);
+      if (rows(account)[relativePath]?.tier == NextcloudMirrorTier.view) continue;
+      await entity.delete();
+    }
   }
 
   @override
   Future<void> purge(NextcloudAccount account) async {
-    final dir = Directory(localPathFor(account, ''));
-    if (await dir.exists()) await dir.delete(recursive: true);
+    for (final dir in [Directory(_accountRoot(account)), Directory(_sidecarRoot(account))]) {
+      if (await dir.exists()) await dir.delete(recursive: true);
+    }
     _rows.remove(account.id);
   }
 }
@@ -375,9 +460,14 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
   // paths whose bytes the budget took back, per call; the entries survive
   final List<Set<String>> demotions = [];
 
+  // paths whose view bytes went back and whose grid bytes are in place again, per call
+  final List<Set<String>> gridDemotions = [];
+
   Set<String> get removed => removals.expand((v) => v).toSet();
 
   Set<String> get demoted => demotions.expand((v) => v).toSet();
+
+  Set<String> get demotedToGrid => gridDemotions.expand((v) => v).toSet();
 
   @override
   Future<bool> putMirroredFile(NextcloudAccount account, NextcloudRemoteItem item, String localPath, NextcloudMirrorTier tier) async {
@@ -400,6 +490,9 @@ class FakeNextcloudSyncSink implements NextcloudSyncSink {
 
   @override
   Future<void> demoteToPlaceholders(NextcloudAccount account, Set<String> relativePaths) async => demotions.add(Set.of(relativePaths));
+
+  @override
+  Future<void> demoteToGrid(NextcloudAccount account, Set<String> relativePaths) async => gridDemotions.add(Set.of(relativePaths));
 }
 
 class MemoryNextcloudSyncStateStore implements NextcloudSyncStateStore {

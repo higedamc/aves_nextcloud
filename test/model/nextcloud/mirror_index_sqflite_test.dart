@@ -342,6 +342,22 @@ void main() {
       expect((await index.get(account, 'v.mp4'))?.placeholderReason, NextcloudPlaceholderReason.unfunded);
     });
 
+    test('the v4 column is added with its default, and a migrated row has no sidecar', () async {
+      await writeV2([v2Row('a.jpg', tier: NextcloudMirrorTier.grid, localSizeBytes: 18062)]);
+
+      final index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+      final db = await databaseFactory.openDatabase(dbPath, options: OpenDatabaseOptions(singleInstance: true));
+
+      final columns = await db.rawQuery('PRAGMA table_info(${SqfliteNextcloudMirrorIndex.table})');
+      expect(columns.map((v) => v['name']), contains('sidecarSizeBytes'));
+      final row = await index.get(account, 'a.jpg');
+      expect(row!.sidecarSizeBytes, 0);
+      expect(row.syncClassBytes, 18062, reason: 'every byte a binary before v4 wrote is sync-class');
+      expect(await index.sumLocalSizeBytes(account, of: NextcloudBudgetClass.sync), 18062);
+      expect(await index.sumLocalSizeBytes(account, of: NextcloudBudgetClass.view), 0);
+    });
+
     test('a reason this binary cannot read is a policy placeholder, as before the column existed', () async {
       await writeV2([v2Row('x.mp4', tier: NextcloudMirrorTier.placeholder)]);
       final index = SqfliteNextcloudMirrorIndex();
@@ -422,6 +438,61 @@ void main() {
 
       final page = await index.getOldestModified(account, limit: 2, tiers: {NextcloudMirrorTier.original});
       expect(page.map((v) => v.relativePath), ['v0.mp4', 'v1.mp4']);
+    });
+  });
+
+  group('budget classes', () {
+    late SqfliteNextcloudMirrorIndex index;
+    final epoch = DateTime.fromMillisecondsSinceEpoch(1000);
+
+    NextcloudMirrorIndexEntry rowFor(String relativePath, {required NextcloudMirrorTier tier, int localSizeBytes = 10, int sidecarSizeBytes = 0, bool pinned = false, int lastAccess = 0}) => NextcloudMirrorIndexEntry(
+      relativePath: relativePath,
+      etag: 'e',
+      fileId: 1,
+      tier: tier,
+      placeholderReason: tier == NextcloudMirrorTier.placeholder ? NextcloudPlaceholderReason.unfunded : null,
+      remoteSizeBytes: 10,
+      localSizeBytes: tier == NextcloudMirrorTier.placeholder ? 0 : localSizeBytes,
+      sidecarSizeBytes: sidecarSizeBytes,
+      pinned: pinned,
+      remoteLastModified: epoch,
+      downloadedAt: epoch,
+      lastAccessAt: epoch.add(Duration(days: lastAccess)),
+    );
+
+    setUp(() async {
+      await databaseFactory.deleteDatabase('${await databaseFactory.getDatabasesPath()}/nextcloud_mirror.db');
+      index = SqfliteNextcloudMirrorIndex();
+      await index.init();
+    });
+
+    // the split lives in the SQL, so the fake index agreeing with `syncClassBytes` proves nothing here
+    test('sums each class as the entry defines it: a view row is its sidecar to the sync and the rest to the view', () async {
+      await index.put(account, rowFor('g.jpg', tier: NextcloudMirrorTier.grid, localSizeBytes: 10));
+      await index.put(account, rowFor('o.mp4', tier: NextcloudMirrorTier.original, localSizeBytes: 20));
+      await index.put(account, rowFor('v.jpg', tier: NextcloudMirrorTier.view, localSizeBytes: 15, sidecarSizeBytes: 5));
+      await index.put(account, rowFor('p.mp4', tier: NextcloudMirrorTier.placeholder));
+
+      expect(await index.sumLocalSizeBytes(account), 45);
+      expect(await index.sumLocalSizeBytes(account, of: NextcloudBudgetClass.sync), 35);
+      expect(await index.sumLocalSizeBytes(account, of: NextcloudBudgetClass.view), 10);
+      final view = await index.get(account, 'v.jpg');
+      expect(view!.sidecarSizeBytes, 5, reason: 'round trips');
+    });
+
+    test('the access order restricted to view rows offers those only, least recently accessed first, and never a placeholder', () async {
+      await index.put(account, rowFor('older.jpg', tier: NextcloudMirrorTier.view, sidecarSizeBytes: 2, lastAccess: 1));
+      await index.put(account, rowFor('newer.jpg', tier: NextcloudMirrorTier.view, sidecarSizeBytes: 2, lastAccess: 2));
+      await index.put(account, rowFor('pinned.jpg', tier: NextcloudMirrorTier.view, sidecarSizeBytes: 2, lastAccess: 0, pinned: true));
+      await index.put(account, rowFor('aaa.jpg', tier: NextcloudMirrorTier.grid, lastAccess: 0));
+      await index.put(account, rowFor('aab.mp4', tier: NextcloudMirrorTier.original, lastAccess: 0));
+      await index.put(account, rowFor('aac.mp4', tier: NextcloudMirrorTier.placeholder, lastAccess: 0));
+
+      final views = await index.getLeastRecentlyAccessed(account, limit: 10, tiers: {NextcloudMirrorTier.view});
+      expect(views.map((v) => v.relativePath), ['older.jpg', 'newer.jpg']);
+      expect(await index.getLeastRecentlyAccessed(account, limit: 10, tiers: {NextcloudMirrorTier.placeholder}), isEmpty);
+      final all = await index.getLeastRecentlyAccessed(account, limit: 10);
+      expect(all.map((v) => v.relativePath), ['aaa.jpg', 'aab.mp4', 'older.jpg', 'newer.jpg'], reason: 'unrestricted: as before, every unpinned row but a placeholder');
     });
   });
 }

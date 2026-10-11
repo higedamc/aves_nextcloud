@@ -46,6 +46,31 @@ void main() {
     expect(http.copyWith(allowInsecureHttp: true).isSchemeAllowed, isTrue);
   });
 
+  group('view allowance', () {
+    const mb = 1024 * 1024;
+
+    test('is a stated slice of the limit, not what the sync leaves over', () {
+      final account = NextcloudAccount.fromJson(json());
+
+      expect(account.cacheLimitBytes, 2048 * mb);
+      expect(account.viewAllowanceBytes, 256 * mb);
+      expect(account.syncBudgetBytes, account.cacheLimitBytes - 256 * mb);
+    });
+
+    test('a small limit keeps three quarters of itself for the sync', () {
+      expect(NextcloudAccount.fromJson({...json(), 'cacheLimitBytes': 100 * mb}).viewAllowanceBytes, 25 * mb);
+      expect(NextcloudAccount.fromJson({...json(), 'cacheLimitBytes': 100 * mb}).syncBudgetBytes, 75 * mb);
+      expect(NextcloudAccount.fromJson({...json(), 'cacheLimitBytes': 0}).viewAllowanceBytes, 0);
+      expect(NextcloudAccount.fromJson({...json(), 'cacheLimitBytes': 0}).syncBudgetBytes, 0);
+    });
+
+    test('is not a setting: it is not stored, and a stored value is not read', () {
+      final account = NextcloudAccount.fromJson({...json(), 'viewAllowanceBytes': 1});
+      expect(account.viewAllowanceBytes, 256 * mb);
+      expect(account.toJson().containsKey('viewAllowanceBytes'), isFalse);
+    });
+  });
+
   group('video auto-download threshold', () {
     test('an account stored before the field existed reads the default, not zero', () {
       final account = NextcloudAccount.fromJson(json());

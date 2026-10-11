@@ -32,10 +32,11 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   Future<Set<NextcloudMirrorIndexEntry>> getAll(NextcloudAccount account) async => _rows(account).values.toSet();
 
   @override
-  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit}) async {
+  Future<List<NextcloudMirrorIndexEntry>> getLeastRecentlyAccessed(NextcloudAccount account, {required int limit, Set<NextcloudMirrorTier>? tiers}) async {
     getLeastRecentlyAccessedCalls++;
-    // same exclusions as the sqflite index: neither a pinned row nor a placeholder can usefully be evicted
-    final entries = _rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder).toList();
+    // same exclusions as the sqflite index: neither a pinned row nor a placeholder can usefully be evicted,
+    // whatever `tiers` says
+    final entries = _rows(account).values.where((v) => !v.pinned && v.tier != NextcloudMirrorTier.placeholder && (tiers == null || tiers.contains(v.tier))).toList();
     // same total order as the sqflite index: `lastAccessAt`, then `relativePath` to break ties
     entries.sort((a, b) {
       final byAccess = a.lastAccessAt.compareTo(b.lastAccessAt);
@@ -73,5 +74,14 @@ class FakeNextcloudMirrorIndex implements NextcloudMirrorIndex {
   Future<void> deleteAll(NextcloudAccount account) async => _rows(account).clear();
 
   @override
-  Future<int> sumLocalSizeBytes(NextcloudAccount account) async => _rows(account).values.fold<int>(0, (sum, v) => sum + v.localSizeBytes);
+  Future<int> sumLocalSizeBytes(NextcloudAccount account, {NextcloudBudgetClass? of}) async => _rows(account).values.fold<int>(
+    0,
+    (sum, v) =>
+        sum +
+        switch (of) {
+          null => v.localSizeBytes,
+          NextcloudBudgetClass.sync => v.syncClassBytes,
+          NextcloudBudgetClass.view => v.viewClassBytes,
+        },
+  );
 }

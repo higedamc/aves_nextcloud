@@ -42,9 +42,9 @@ class NextcloudSyncProgress {
 class NextcloudSyncResult {
   final int added, updated, removed, skipped, evicted;
 
-  // rows whose bytes the budget took back: still in the gallery as placeholders, streamed on demand. Not
-  // `evicted`, which counts rows that left the mirror altogether; the distinction decides whether the
-  // run's etags survive, see the use case.
+  // rows whose bytes the budget took back: to a placeholder (still in the gallery, streamed on demand) or,
+  // for a view row, back to its grid bytes. Not `evicted`, which counts rows that left the mirror
+  // altogether; the distinction decides whether the run's etags survive, see the use case.
   final int demoted;
 
   // rows whose mirror file was missing and that the listing could not refill: dropped with their entries
@@ -89,4 +89,13 @@ abstract class NextcloudSyncUseCase {
 
   // Unpins a held original. The bytes stay, evictable like any other row, until the budget wants them.
   Future<NextcloudFailure?> releaseOriginal(NextcloudAccount account, String relativePath);
+
+  // The item was opened. Records the access on its row whatever follows, then, for a row held at `grid`,
+  // fetches the screen-sized `view` tier inside `NextcloudAccount.viewAllowanceBytes`, keeping the grid
+  // bytes as a sidecar so the budget can give the view bytes back offline. Runs under the same per-account
+  // serialization as `run`, so a sync in flight is waited for in full (the viewer shows the grid bytes
+  // meanwhile). Completes with the failure rather than throwing it; `null` is success, and also "nothing
+  // to do": an item the mirror does not hold, holds at another tier, or that changed on the server since
+  // the row was written (the sync owns changes). A `NextcloudQuotaFailure` is the allowance saying no.
+  Future<NextcloudFailure?> fetchView(NextcloudAccount account, String relativePath, {NextcloudCancellation? cancellation});
 }

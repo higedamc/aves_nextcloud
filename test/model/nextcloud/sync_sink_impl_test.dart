@@ -188,6 +188,7 @@ void main() {
     db.clearRecords();
     // favourites and covers are already empty: `MediaStoreSource.init` reloads both from the fake DB (`{}`)
     (mediaFetchService as FakeMediaFetchService).entries = {};
+    (mediaFetchService as FakeMediaFetchService).getEntryUris.clear();
   });
 
   tearDown(() {
@@ -410,7 +411,7 @@ void main() {
       expect(inCollection(Uri.file(localA).toString()).length, 1);
       expect(inCollection(Uri.file(localB).toString()), isEmpty, reason: "the builder's location must not reach the row");
       // never consulted: there are no bytes to read
-      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+      expect((mediaFetchService as FakeMediaFetchService).getEntryUris, isEmpty);
     });
 
     test('a later fetch of real bytes refreshes the placeholder instead of adding a second entry', () async {
@@ -449,7 +450,7 @@ void main() {
       );
       expect(inCollection(uriA).map((v) => v.id), {placeholderId}, reason: 'and the entry stays the same entry, with its favourite and cover');
       expect(db.removals.where((r) => r.$2 == null || r.$2!.contains(EntryDataType.basic)), isEmpty, reason: 'nothing about a placeholder re-put wants the row gone');
-      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty, reason: 'still never consulted: there are no bytes to read');
+      expect((mediaFetchService as FakeMediaFetchService).getEntryUris, isEmpty, reason: 'still never consulted: there are no bytes to read');
     });
 
     test("a second put over the same placeholder still carries the server's new properties into the entry and its row", () async {
@@ -489,6 +490,60 @@ void main() {
       expect(db.updates.map((u) => u.$1), contains(placeholderId), reason: 'persisted by update, not by delete-and-write-back');
     });
 
+    test("a second put over a video placeholder keeps the server's dimensions, which a read of the file it has not got would zero", () async {
+      source = await initSource();
+      sink = NextcloudCollectionSyncSink(source, mirror);
+      const relV = '2024/a.mp4';
+      final localV = mirror.localPathFor(account, relV);
+      const dims = NextcloudPhotoMetadata(width: 1920, height: 1080, originalDateTime: null, latitude: null, longitude: null);
+      final video = itemFor(relV, photoMetadata: dims, mimeType: 'video/mp4');
+
+      expect(await sink.putPlaceholder(account, video), isTrue);
+      final placeholderId = db.inserts.single.single.id;
+      expect(db.rows[placeholderId]!.width, 1920);
+
+      // what `FileImageProvider.fetchSingle` answers for a `file://` *video* URI whose file does not exist:
+      // `file.exists()` is false so nothing sizes it, but `isVideo` passes the `allowUnsized || isSized ||
+      // isSvg || isVideo` gate, so it is reported as a *success* with null dimensions, and
+      // `AvesEntry.fromMap` turns those into 0. The image answer is a `PlatformException` and then null,
+      // which is why the fake's default (null for an unknown URI) cannot stand in for this.
+      (mediaFetchService as FakeMediaFetchService).entries = {
+        AvesEntry(
+          id: null,
+          uri: Uri.file(localV).toString(),
+          path: localV,
+          contentId: null,
+          pageId: null,
+          sourceMimeType: 'video/mp4',
+          width: 0,
+          height: 0,
+          sourceRotationDegrees: 0,
+          sizeBytes: null,
+          sourceTitle: null,
+          dateAddedSecs: null,
+          dateModifiedMillis: null,
+          sourceDateTakenMillis: null,
+          durationMillis: null,
+          trashed: false,
+          origin: EntryOrigins.file,
+        ),
+      };
+
+      expect(await sink.putPlaceholder(account, video), isTrue);
+
+      expect(
+        source.getEntryById(placeholderId)!.width,
+        1920,
+        reason: 'the server dimensions this put just applied must survive the rest of the refresh',
+      );
+      expect(db.rows[placeholderId]!.width, 1920, reason: 'and the row the next launch reads says the same');
+      expect(
+        (mediaFetchService as FakeMediaFetchService).getEntryUris,
+        isEmpty,
+        reason: 'the file is never read on this path, which is what keeps the 0x0 answer out',
+      );
+    });
+
     test('a builder that cannot make an entry is a refusal, not a failure', () async {
       source = await initSource();
       sink = NextcloudCollectionSyncSink(source, mirror, placeholders: const _StubPlaceholders(null));
@@ -526,7 +581,7 @@ void main() {
       expect(inserted.sizeBytes, 42);
       expect(inserted.sourceDateTakenMillis, DateTime.utc(2023, 5, 6, 12).millisecondsSinceEpoch);
       // never consulted: there are no bytes to read
-      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+      expect((mediaFetchService as FakeMediaFetchService).getEntryUris, isEmpty);
     });
 
     test('an item the default builder cannot make an entry for is a refusal, not a thrown error', () async {
@@ -599,7 +654,7 @@ void main() {
       // but the tile and the viewer must look again, since the bytes they decoded are gone
       expect(visualChanges, 1);
       // never consulted: there are no new bytes to read
-      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+      expect((mediaFetchService as FakeMediaFetchService).getEntryUris, isEmpty);
     });
 
     test('a path with no entry in the loaded collection is skipped, not an error', () async {
@@ -663,7 +718,7 @@ void main() {
       expect(db.removals.length, removalsBefore);
       expect(db.updates.length, updatesBefore);
       expect(visualChanges, 1, reason: 'the cached images are still dropped: they decode bytes that are not there');
-      expect((mediaFetchService as FakeMediaFetchService).entries, isEmpty);
+      expect((mediaFetchService as FakeMediaFetchService).getEntryUris, isEmpty);
     });
   });
 }

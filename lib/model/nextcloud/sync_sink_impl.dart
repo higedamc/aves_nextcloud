@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:aves/model/covers.dart';
 import 'package:aves/model/entry/cache.dart';
 import 'package:aves/model/entry/entry.dart';
+import 'package:aves/model/entry/extensions/location.dart';
 import 'package:aves/model/entry/origins.dart';
 import 'package:aves/model/favourites.dart';
 import 'package:aves/model/metadata/catalog.dart';
@@ -13,6 +14,7 @@ import 'package:aves/model/nextcloud/mirror_store.dart';
 import 'package:aves/model/nextcloud/placeholder_entries.dart';
 import 'package:aves/model/nextcloud/remote_item.dart';
 import 'package:aves/model/nextcloud/sync_ports.dart';
+import 'package:aves/model/settings/settings.dart';
 import 'package:aves/model/source/collection_source.dart';
 import 'package:aves/model/source/events.dart';
 import 'package:aves/services/common/services.dart';
@@ -184,11 +186,27 @@ class NextcloudCollectionSyncSink implements NextcloudSyncSink {
           // the same edge by checking the file exists; here the caller already knows.
           //
           // So the synthesised fields are applied to the entry and its row directly -- `applyNewFields`
-          // persists with `updateEntry`, which is an update and not a delete -- and the rest of the
-          // refresh is still asked for, since what changed between two placeholder puts (the server's
-          // dimensions, its modification date, its GPS) is exactly what those steps publish.
+          // persists with `updateEntry`, which is an update and not a delete -- and what changed between
+          // two placeholder puts (the server's dimensions, its modification date, its GPS) is published by
+          // the steps inlined below.
           await existing.applyNewFields(fetched.toDatabaseMap(), persist: true);
-          await _source.refreshEntries({existing}, {EntryDataType.aspectRatio, EntryDataType.address});
+          // What is left of the refresh is done here rather than through `refreshEntries`, which cannot be
+          // asked to skip the file read: it calls `AvesEntry.refresh` on every entry *before* it looks at
+          // `dataTypes`, and `refresh` goes to `mediaFetchService.getEntry` on this URI whatever is asked
+          // for. The platform's answer for a missing file is not uniformly null, so that read is not merely
+          // wasted: `FileImageProvider` reports *success* for a video (`isVideo` passes its unsized gate)
+          // with null dimensions, `AvesEntry.fromMap` turns those into `0`, and `applyNewFields` would
+          // overwrite the server's dimensions applied one line above with `0x0` -- persisted, so every
+          // over-threshold video goes square on every force run. For an image the same read is a recorded
+          // error per placeholder per run. So this inlines the tail of `refreshEntries` for the two data
+          // types a second placeholder put can actually change.
+          await existing.locate(background: false, force: true, geocoderLocale: settings.avesLocale);
+          await localMediaDb.updateAddress(existing.id, existing.addressDetails);
+          _source
+            ..onAspectRatioChanged()
+            ..onAddressMetadataChanged()
+            ..updateDerivedFilters({existing})
+            ..eventBus.fire(EntryRefreshedEvent({existing}));
         }
         // New bytes at the same path, by definition of a put over an existing entry: the images decoded
         // from the old ones must go. `refresh` only notices a visual change through the file date, and a

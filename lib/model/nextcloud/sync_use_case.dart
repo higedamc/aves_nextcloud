@@ -697,9 +697,8 @@ class NextcloudSyncUseCaseImpl implements NextcloudSyncUseCase {
   // Written over a row that holds bytes — a changed file the budget cannot fund, or an image the server can
   // no longer derive — the store gives those bytes back (`NextcloudMirrorStore.record`), and the sink is
   // told the way it is told about an eviction, not asked for a placeholder: the entry exists and its bytes
-  // are gone, which is a demotion, and `putPlaceholder` on an existing entry refreshes it by reading its
-  // file, which with the file gone drops the entry. Counted as `demoted`, not `updated`: nothing was
-  // refreshed, the budget took bytes back.
+  // are gone, which is a demotion. Counted as `demoted`, not `updated`: nothing was refreshed, the budget
+  // took bytes back.
   Future<void> _recordPlaceholder(NextcloudAccount account, NextcloudRemoteItem item, NextcloudMirrorIndexEntry? existing, _Stats stats, {required NextcloudPlaceholderReason reason}) async {
     final path = item.relativePath;
     final heldBytes = existing != null && existing.tier != NextcloudMirrorTier.placeholder;

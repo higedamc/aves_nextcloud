@@ -106,11 +106,13 @@ class MultistatusParser {
     final height = _childInt(size, 'height');
 
     final dateSecs = int.tryParse(_text(prop, 'metadata-photos-original_date_time', DavNamespaces.nc) ?? '');
-    final originalDateTime = dateSecs != null && dateSecs > 0 ? DateTime.fromMillisecondsSinceEpoch(dateSecs * 1000, isUtc: true) : null;
+    final originalDateTime = dateSecs != null && dateSecs > 0 && dateSecs <= _maxDateSeconds ? DateTime.fromMillisecondsSinceEpoch(dateSecs * 1000, isUtc: true) : null;
 
     final gps = prop.getElement('metadata-photos-gps', namespace: DavNamespaces.nc);
-    final latitude = _childDouble(gps, 'latitude');
-    final longitude = _childDouble(gps, 'longitude');
+    // in range or absent, for the same reason `NaN` is absent below: `hasGps` is a null check, so a
+    // coordinate outside the only values a coordinate can take would still be published as a location
+    final latitude = _inRange(_childDouble(gps, 'latitude'), 90);
+    final longitude = _inRange(_childDouble(gps, 'longitude'), 180);
 
     if (width == null && height == null && originalDateTime == null && latitude == null && longitude == null) return null;
     return NextcloudPhotoMetadata(
@@ -136,15 +138,60 @@ class MultistatusParser {
     return text == null || text.isEmpty ? null : text;
   }
 
+  // A dimension the server declares is a positive whole number of pixels, and anything else is not a
+  // partial answer but a wrong one, so it is read as unknown. The guard is here rather than at the call
+  // sites because the parser is the one place every consumer reads through, and because `.toInt()` on
+  // what the server said is not safe:
+  //
+  // - it **throws** `UnsupportedError` on a non-finite double, and `NaN`, `Infinity`, `-Infinity` and
+  //   `1e400` are all things a `<width>` can say. `_toItem` is called with no `try`, and `UnsupportedError`
+  //   is not a `NextcloudFailure`, so one such field used to abort the whole sync run out of `parse()`:
+  //   no etags saved, nothing listed, on every run until that one file's server-side metadata changed.
+  // - it saturates silently on a finite-but-huge double (`1e30` -> `9223372036854775807`), which is why
+  //   rejecting non-finite values alone is not enough.
+  //
+  // `_maxDimension` is a sanity bound, not a format limit: it is far above any real image (a stitched
+  // gigapixel panorama is tens of thousands of pixels per side) and far below the magnitudes that only
+  // arise from a server writing a float, a counter or a corrupted field into this element.
+  static const _maxDimension = 1 << 20;
+
+  // The same contract for the capture date, which `dateSecs * 1000` reaches by two different routes:
+  //
+  // - `DateTime.fromMillisecondsSinceEpoch` **throws** `RangeError` outside +/-8.64e15 ms, so a plain
+  //   `10000000000000` (a server writing milliseconds, or microseconds, where the property says seconds)
+  //   aborted the crawl exactly as a non-finite `<width>` did.
+  // - above that, `dateSecs * 1000` wraps: 2^63-1 seconds becomes -1000 ms, i.e. a confident
+  //   `1969-12-31` for a photo, which is worse than no date at all.
+  //
+  // The bound is the last second `DateTime` can render (9999-12-31T23:59:59Z): far beyond any capture
+  // date, and below a milliseconds value mistakenly sent as seconds (1.76e12 > 2.53e11), so that
+  // common server-side mistake is read as unknown rather than filed under the year 57800.
+  static const _maxDateSeconds = 253402300799;
+
   static int? _childInt(XmlElement? parent, String localName) {
     final text = _childText(parent, localName);
-    return text == null ? null : num.tryParse(text)?.toInt();
+    if (text == null) return null;
+    final value = num.tryParse(text);
+    if (value == null || !value.isFinite) return null;
+    // `0` already means unknown downstream (`displayAspectRatio`), and a negative or fractional count of
+    // pixels is not a number this parser can stand behind
+    if (value <= 0 || value > _maxDimension || value != value.truncate()) return null;
+    return value.toInt();
   }
 
+  // Same contract for the GPS pair: a non-finite coordinate reaches `CatalogMetadata` and from there the
+  // country lookup and the geocoder, and neither gate stops it -- `NextcloudPhotoMetadata.hasGps` is a null
+  // check and `AvesEntry.hasGps` is `!= 0`, which `NaN` passes. So an item would claim a location that no
+  // lookup can resolve. Unlike the dimensions above this one never threw: `double.tryParse` is total and
+  // nothing calls `.toInt()` on it.
   static double? _childDouble(XmlElement? parent, String localName) {
     final text = _childText(parent, localName);
-    return text == null ? null : double.tryParse(text);
+    if (text == null) return null;
+    final value = double.tryParse(text);
+    return value == null || !value.isFinite ? null : value;
   }
+
+  static double? _inRange(double? value, double limit) => value == null || value.abs() > limit ? null : value;
 
   static bool _parseBool(String? text) => text == 'true' || text == '1';
 
